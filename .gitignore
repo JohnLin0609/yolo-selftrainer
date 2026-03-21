@@ -1,0 +1,20 @@
+# Runtime state
+next_instruction.md
+round_counter
+session_id
+last_run_name
+train.pid
+current.log
+
+# Logs (large JSONL files)
+logs/
+
+# Claude config
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store

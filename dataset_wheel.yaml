@@ -1,0 +1,6 @@
+path: /home/johnlin/workspace/aoi/yolov11obb/dataset/20260320_wheel
+train: images/train
+val: images/val
+
+names:
+  0: defect
