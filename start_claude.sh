@@ -192,6 +192,11 @@ for line in open('$TEMP_LOG_DIR/claude_raw.jsonl'):
         print()
 " > "$TEMP_LOG_DIR/claude_session.log" 2>/dev/null
 
+# ─── Copy the next_instruction.md Claude wrote into the log folder ─────
+if [ -f "$INSTRUCTION" ]; then
+  cp "$INSTRUCTION" "$TEMP_LOG_DIR/next_instruction.md"
+fi
+
 # ─── Rename log folder to match the training run name ─────────────────
 sleep 3
 if [ -f "$SCRIPT_DIR/last_run_name" ]; then

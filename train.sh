@@ -9,13 +9,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Parameters — edit these each cycle using sed
 WEIGHTS=${1:-"/home/johnlin/workspace/aoi/yolov11obb/models/pretrained/yolo11n-obb.pt"}
-EPOCHS=200
-LR=0.001
-LR_FINAL=0.001
+EPOCHS=2000
+LR=0.002
+LR_FINAL=0.002
 BATCH=-1
 IMGSZ=1024
-PATIENCE=60
-OPTIMIZER="auto"
+PATIENCE=500
+OPTIMIZER="AdamW"
 MOMENTUM=0.937
 WEIGHT_DECAY=0.0005
 WARMUP_EPOCHS=3.0
