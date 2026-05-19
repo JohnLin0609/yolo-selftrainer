@@ -1,0 +1,1110 @@
+#!/bin/bash
+# Scaffold a new YOLO self-training project from templates.
+# Usage: bash scripts/new_project.sh --dataset PATH [options]
+# Minimal: bash scripts/new_project.sh --dataset /path/to/dataset
+# Everything else is auto-detected: task, classes, resolution, model, split.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+TEMPLATES_DIR="$ROOT_DIR/templates"
+
+# ─── Defaults ─────────────────────────────────────────────────────────
+NAME=""
+TASK=""
+DATASET=""
+MODEL=""
+FALLBACK=""
+IMGSZ=""
+CLASSES=""
+IMAGE_INFO=""
+BASELINE=""
+MAX_ROUNDS=10
+DEVICE=0
+KPT_SHAPE=""
+FORCE=false
+AUTO_SPLIT=true
+NO_AUTO_SPLIT=false
+# P6 multi-LLM agent mode. Default "claude" preserves the original Claude-CLI
+# flow; "agent" scaffolds start_agent.sh + agent.env (used by run_agent.py).
+LOOP_MODE="claude"
+LLM_PROVIDER="anthropic"
+LLM_MODEL="claude-opus-4-7"
+LLM_API_BASE=""
+
+# ─── Parse arguments ─────────────────────────────────────────────────
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --name)       NAME="$2"; shift 2 ;;
+        --task)       TASK="$2"; shift 2 ;;
+        --dataset)    DATASET="$2"; shift 2 ;;
+        --model)      MODEL="$2"; shift 2 ;;
+        --fallback)   FALLBACK="$2"; shift 2 ;;
+        --imgsz)      IMGSZ="$2"; shift 2 ;;
+        --classes)    CLASSES="$2"; shift 2 ;;
+        --image-info) IMAGE_INFO="$2"; shift 2 ;;
+        --baseline)   BASELINE="$2"; shift 2 ;;
+        --max-rounds) MAX_ROUNDS="$2"; shift 2 ;;
+        --device)     DEVICE="$2"; shift 2 ;;
+        --kpt-shape)  KPT_SHAPE="$2"; shift 2 ;;
+        --mode)         LOOP_MODE="$2"; shift 2 ;;
+        --llm-provider) LLM_PROVIDER="$2"; shift 2 ;;
+        --llm-model)    LLM_MODEL="$2"; shift 2 ;;
+        --llm-api-base) LLM_API_BASE="$2"; shift 2 ;;
+        --force)         FORCE=true; shift ;;
+        --auto-split)    AUTO_SPLIT=true; shift ;;
+        --no-auto-split) NO_AUTO_SPLIT=true; AUTO_SPLIT=false; shift ;;
+        -h|--help)
+            echo "Usage: bash scripts/new_project.sh --dataset PATH [options]"
+            echo ""
+            echo "Required:"
+            echo "  --dataset PATH     Path to dataset directory"
+            echo ""
+            echo "Auto-detected (override with flags):"
+            echo "  --name NAME        Project name (default: dataset folder name)"
+            echo "  --task TASK        detect, obb, segment, pose, classify (default: auto-detect from labels)"
+            echo "  --classes STR      Class mapping (default: from classes.txt or labels)"
+            echo "  --imgsz N          Image size (default: 1024 if >1920px, else 640)"
+            echo "  --image-info STR   Image description (default: auto-detect from first image)"
+            echo ""
+            echo "Optional:"
+            echo "  --model FILE       Primary model filename (default: auto per task)"
+            echo "  --fallback FILE    Fallback model filename"
+            echo "  --baseline N       Baseline metric value to beat"
+            echo "  --max-rounds N     Max training rounds (default: 10)"
+            echo "  --device N         GPU device (default: 0)"
+            echo "  --kpt-shape STR    Keypoint shape for pose (e.g., '17 3')"
+            echo "  --force            Overwrite existing project"
+            echo "  --no-auto-split    Don't auto-split flat datasets (default: auto-split)"
+            exit 0
+            ;;
+        *) echo "ERROR: Unknown argument: $1"; exit 1 ;;
+    esac
+done
+
+# ─── Validate required args ──────────────────────────────────────────
+if [ -z "$DATASET" ]; then echo "ERROR: --dataset is required."; exit 1; fi
+
+if [ ! -d "$DATASET" ]; then
+    echo "ERROR: Dataset path does not exist: $DATASET"
+    exit 1
+fi
+# Fail-loud (Harness §二): after the dir check, realpath failure is unexpected.
+RESOLVED="$(realpath "$DATASET")"
+if [ -z "$RESOLVED" ]; then
+    echo "ERROR: realpath failed on $DATASET" >&2
+    exit 1
+fi
+DATASET="$RESOLVED"
+
+# ─── Auto-detect name from dataset folder ─────────────────────────────
+if [ -z "$NAME" ]; then
+    NAME=$(basename "$DATASET" | sed 's/[^a-zA-Z0-9_-]/_/g')
+    echo "[AUTO] Project name: $NAME (from dataset folder)"
+fi
+
+# ─── Auto-detect task from label format ───────────────────────────────
+if [ -z "$TASK" ]; then
+    echo "[AUTO] Detecting task type from labels..."
+    # Check for classify (folder-per-class, no labels dir)
+    if [ -d "$DATASET/train" ] && [ ! -d "$DATASET/labels" ] && [ ! -d "$DATASET/images" ]; then
+        TASK="classify"
+    elif [ -d "$DATASET/images" ] && [ ! -d "$DATASET/labels" ]; then
+        TASK="classify"
+    else
+        # Detect from label file field count
+        LABEL_DIR="$DATASET/labels"
+        [ -d "$LABEL_DIR/train" ] && LABEL_DIR="$LABEL_DIR/train"
+        FIRST_LABEL=$(find "$LABEL_DIR" -name "*.txt" -type f ! -empty 2>/dev/null | head -1)
+        if [ -z "$FIRST_LABEL" ]; then
+            echo "ERROR: No non-empty label files found. Cannot auto-detect task."
+            echo "Specify --task manually: detect, obb, segment, pose, classify"
+            exit 1
+        fi
+        FIELD_COUNT=$(awk '{print NF; exit}' "$FIRST_LABEL")
+        case "$FIELD_COUNT" in
+            5)  TASK="detect" ;;
+            9)  TASK="obb" ;;
+            *)
+                # >9 variable fields = likely segment (polygon), or pose
+                # Check if field count is consistent (segment varies, pose is fixed)
+                FIELD_COUNTS=$(awk '{print NF}' "$FIRST_LABEL" | sort -u | wc -l)
+                if [ "$FIELD_COUNTS" -gt 1 ]; then
+                    TASK="segment"
+                else
+                    # Fixed field count >5: could be pose
+                    # Pose: 5 + 3*num_keypoints (with visibility) or 5 + 2*num_keypoints
+                    EXTRA=$((FIELD_COUNT - 5))
+                    if [ $((EXTRA % 3)) -eq 0 ] && [ "$EXTRA" -gt 0 ]; then
+                        TASK="pose"
+                        KPT_NUM=$((EXTRA / 3))
+                        KPT_SHAPE="$KPT_NUM 3"
+                        echo "[AUTO] Detected pose with $KPT_NUM keypoints (3D)"
+                    elif [ $((EXTRA % 2)) -eq 0 ] && [ "$EXTRA" -gt 0 ]; then
+                        TASK="pose"
+                        KPT_NUM=$((EXTRA / 2))
+                        KPT_SHAPE="$KPT_NUM 2"
+                        echo "[AUTO] Detected pose with $KPT_NUM keypoints (2D)"
+                    else
+                        TASK="segment"
+                    fi
+                fi
+                ;;
+        esac
+    fi
+    echo "[AUTO] Task type: $TASK (from label format: $FIELD_COUNT fields)"
+fi
+
+case "$TASK" in
+    detect|obb|segment|pose|classify) ;;
+    *) echo "ERROR: --task must be one of: detect, obb, segment, pose, classify"; exit 1 ;;
+esac
+
+if [ "$TASK" = "pose" ] && [ -z "$KPT_SHAPE" ]; then
+    echo "ERROR: --kpt-shape is required for pose task (could not auto-detect)."
+    echo "Format: --kpt-shape 'NUM_KEYPOINTS DIMENSIONS'"
+    echo "Example: --kpt-shape '17 3'  (COCO pose: 17 keypoints, x/y/visibility)"
+    exit 1
+fi
+
+# ─── Auto-detect image resolution ────────────────────────────────────
+if [ -z "$IMAGE_INFO" ]; then
+    echo "[AUTO] Detecting image resolution..."
+    IMG_DIR="$DATASET/images"
+    [ -d "$IMG_DIR/train" ] && IMG_DIR="$IMG_DIR/train"
+    [ "$TASK" = "classify" ] && IMG_DIR="$DATASET/train" && [ -d "$IMG_DIR" ] || IMG_DIR="$DATASET/images"
+    FIRST_IMG=$(find "$IMG_DIR" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.bmp" -o -name "*.tif" \) 2>/dev/null | head -1)
+    if [ -n "$FIRST_IMG" ]; then
+        IMG_EXT=$(echo "${FIRST_IMG##*.}" | tr '[:lower:]' '[:upper:]')
+        IMG_RES=$(source "$ROOT_DIR/.venv/bin/activate" 2>/dev/null; python3 -c "from PIL import Image; img=Image.open('$FIRST_IMG'); print(f'{img.size[0]}x{img.size[1]}')" 2>/dev/null)
+        if [ -n "$IMG_RES" ]; then
+            IMAGE_INFO="$IMG_RES $IMG_EXT"
+            echo "[AUTO] Image info: $IMAGE_INFO"
+        else
+            IMAGE_INFO="unknown resolution"
+        fi
+    else
+        IMAGE_INFO="unknown resolution"
+    fi
+fi
+
+# ─── Check existing project ──────────────────────────────────────────
+PROJECT_DIR="$ROOT_DIR/projects/$NAME"
+if [ -d "$PROJECT_DIR" ]; then
+    if [ "$FORCE" = "true" ]; then
+        if [ -f "$PROJECT_DIR/train.pid" ]; then
+            OLD_PID=$(cat "$PROJECT_DIR/train.pid")
+            if kill -0 "$OLD_PID" 2>/dev/null; then
+                echo "ERROR: Training is actively running (PID $OLD_PID). Cannot overwrite."
+                echo "Wait for training to finish, or kill it: kill $OLD_PID"
+                exit 1
+            fi
+        fi
+        echo "[WARN] Overwriting existing project: $PROJECT_DIR"
+        if [ -d "$PROJECT_DIR/logs" ]; then
+            BACKUP="$PROJECT_DIR/logs_backup_$(date +%Y%m%d_%H%M%S)"
+            mv "$PROJECT_DIR/logs" "$BACKUP"
+            echo "[WARN] Existing logs moved to: $BACKUP"
+        fi
+    else
+        echo "ERROR: Project '$NAME' already exists at: $PROJECT_DIR"
+        echo "Options:"
+        echo "  1. Choose a different --name"
+        echo "  2. Delete it manually: rm -rf $PROJECT_DIR"
+        echo "  3. Overwrite with: --force"
+        exit 1
+    fi
+fi
+
+# ─── Check dataset split status ───────────────────────────────────────
+IS_SPLIT=false
+if [ "$TASK" = "classify" ]; then
+    if [ -d "$DATASET/train" ]; then
+        IS_SPLIT=true
+    fi
+else
+    if [ -d "$DATASET/images/train" ]; then
+        IS_SPLIT=true
+    fi
+fi
+
+if [ "$IS_SPLIT" = "false" ]; then
+    if [ "$NO_AUTO_SPLIT" = "true" ]; then
+        echo "ERROR: Dataset is not split into train/val."
+        echo "Remove --no-auto-split to auto-split 80/20, or split manually."
+        exit 1
+    fi
+    echo "[AUTO] Auto-splitting dataset 80/20..."
+    if [ "$TASK" = "classify" ]; then
+        echo "ERROR: Auto-split for classify datasets is not yet supported. Please split manually."
+        exit 1
+    fi
+        python3 -c "
+import random, shutil
+from pathlib import Path
+dataset_dir = Path('$DATASET')
+src_images = dataset_dir / 'images'
+src_labels = dataset_dir / 'labels'
+if (src_images / 'train').is_dir():
+    print('Already split'); exit()
+exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+images = sorted([f for f in src_images.iterdir() if f.suffix.lower() in exts])
+random.seed(0); random.shuffle(images)
+split_idx = max(1, int(len(images) * 0.8))
+for subset, img_list in [('train', images[:split_idx]), ('val', images[split_idx:])]:
+    (src_images / subset).mkdir(exist_ok=True)
+    (src_labels / subset).mkdir(exist_ok=True)
+    for img in img_list:
+        shutil.move(str(img), str(src_images / subset / img.name))
+        lbl = src_labels / (img.stem + '.txt')
+        if lbl.exists(): shutil.move(str(lbl), str(src_labels / subset / lbl.name))
+print(f'Split: train={split_idx}, val={len(images)-split_idx}')
+"
+        IS_SPLIT=true
+fi
+
+# ─── Count images ────────────────────────────────────────────────────
+if [ "$TASK" = "classify" ]; then
+    TRAIN_COUNT=$(find "$DATASET/train" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) | wc -l)
+    VAL_COUNT=$(find "$DATASET/val" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) | wc -l)
+else
+    TRAIN_COUNT=$(find "$DATASET/images/train" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.bmp" -o -name "*.tif" \) 2>/dev/null | wc -l)
+    VAL_COUNT=$(find "$DATASET/images/val" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.bmp" -o -name "*.tif" \) 2>/dev/null | wc -l)
+fi
+TOTAL_COUNT=$((TRAIN_COUNT + VAL_COUNT))
+echo "[INFO] Dataset: $TRAIN_COUNT train + $VAL_COUNT val = $TOTAL_COUNT images"
+
+# ─── Detect classes ───────────────────────────────────────────────────
+if [ -z "$CLASSES" ]; then
+    if [ "$TASK" = "classify" ]; then
+        CLASSES=$(ls -1 "$DATASET/train" 2>/dev/null | sort | awk '{printf "%d:%s,", NR-1, $0}' | sed 's/,$//')
+    elif [ -f "$DATASET/classes.txt" ]; then
+        CLASSES=$(awk '{printf "%d:%s,", NR-1, $0}' "$DATASET/classes.txt" | sed 's/,$//')
+    else
+        FIRST_LABEL=$(find "$DATASET/labels" -name "*.txt" -type f 2>/dev/null | head -1)
+        if [ -n "$FIRST_LABEL" ]; then
+            NUM_CLASSES=$(awk '{print $1}' "$FIRST_LABEL" | sort -u | wc -l)
+            CLASSES=$(seq 0 $((NUM_CLASSES - 1)) | awk '{printf "%d:class_%d,", $1, $1}' | sed 's/,$//')
+        else
+            CLASSES="0:class_0"
+        fi
+    fi
+fi
+echo "[INFO] Classes: $CLASSES"
+
+NUM_CLASSES=$(echo "$CLASSES" | tr ',' '\n' | wc -l)
+
+# ─── Validate model ──────────────────────────────────────────────────
+MODELS_DIR="$ROOT_DIR/models/pretrained"
+
+if [ -z "$MODEL" ]; then
+    case "$TASK" in
+        detect)   MODEL="yolo11n.pt" ;;
+        obb)      MODEL="yolo11n-obb.pt" ;;
+        segment)  MODEL="yolo11n-seg.pt" ;;
+        pose)     MODEL="yolo11n-pose.pt" ;;
+        classify) MODEL="yolo11n-cls.pt" ;;
+    esac
+fi
+
+if [ ! -f "$MODELS_DIR/$MODEL" ]; then
+    echo "ERROR: Model not found: $MODELS_DIR/$MODEL"
+    echo "Run: bash scripts/download_models.sh --task $TASK"
+    exit 1
+fi
+
+if [ -z "$FALLBACK" ]; then
+    case "$TASK" in
+        detect)   FALLBACK="yolov8n.pt" ;;
+        obb)      FALLBACK="yolov8n-obb.pt" ;;
+        segment)  FALLBACK="yolov8n-seg.pt" ;;
+        pose)     FALLBACK="yolov8n-pose.pt" ;;
+        classify) FALLBACK="yolov8n-cls.pt" ;;
+    esac
+fi
+
+# ─── Set task-specific defaults ───────────────────────────────────────
+VENV_PATH="$ROOT_DIR/.venv"
+RUNS_DIR="$ROOT_DIR/runs"
+DATASET_YAML_PATH="$ROOT_DIR/datasets/$NAME/dataset.yaml"
+
+if [ -z "$IMGSZ" ]; then
+    WIDTH=$(echo "$IMAGE_INFO" | grep -oP '^\d+' | head -1)
+    if [ -n "$WIDTH" ] && [ "$WIDTH" -gt 1920 ] 2>/dev/null; then
+        IMGSZ=1024
+        echo "[AUTO] IMGSZ=1024 (source images ${WIDTH}px wide > 1920px)"
+    else
+        IMGSZ=640
+        echo "[AUTO] IMGSZ=640"
+    fi
+fi
+
+case "$TASK" in
+    detect)
+        DEGREES=0.0; FLIPUD=0.0; FLIPLR=0.5; MOSAIC=1.0; MIXUP=0.0; COPY_PASTE=0.0; ERASING=0.4; SCALE=0.5
+        PRIMARY_METRIC="mAP50(B)"
+        PRIMARY_METRIC_COL=8
+        BEST_METRIC_AWK="awk -F',' 'NR>1 {if(\$8+0 > max) {max=\$8+0; line=\$0}} END {print max, line}' \"\$LATEST/results.csv\""
+        ;;
+    obb)
+        DEGREES=0.0; FLIPUD=0.5; FLIPLR=0.5; MOSAIC=1.0; MIXUP=0.0; COPY_PASTE=0.0; ERASING=0.4; SCALE=0.5
+        PRIMARY_METRIC="mAP50(B)"
+        PRIMARY_METRIC_COL=9
+        BEST_METRIC_AWK="awk -F',' 'NR>1 {if(\$9+0 > max) {max=\$9+0; line=\$0}} END {print max, line}' \"\$LATEST/results.csv\""
+        ;;
+    segment)
+        DEGREES=0.0; FLIPUD=0.0; FLIPLR=0.5; MOSAIC=1.0; MIXUP=0.0; COPY_PASTE=0.1; ERASING=0.4; SCALE=0.5
+        PRIMARY_METRIC="mAP50(M)"
+        PRIMARY_METRIC_COL=13
+        BEST_METRIC_AWK="awk -F',' 'NR>1 {if(\$13+0 > max) {max=\$13+0; line=\$0}} END {print max, line}' \"\$LATEST/results.csv\""
+        ;;
+    pose)
+        DEGREES=0.0; FLIPUD=0.0; FLIPLR=0.5; MOSAIC=1.0; MIXUP=0.0; COPY_PASTE=0.0; ERASING=0.4; SCALE=0.5
+        PRIMARY_METRIC="mAP50(P)"
+        PRIMARY_METRIC_COL=13
+        BEST_METRIC_AWK="awk -F',' 'NR>1 {if(\$13+0 > max) {max=\$13+0; line=\$0}} END {print max, line}' \"\$LATEST/results.csv\""
+        ;;
+    classify)
+        DEGREES=0.0; FLIPUD=0.0; FLIPLR=0.5; MOSAIC=1.0; MIXUP=0.1; COPY_PASTE=0.0; ERASING=0.4; SCALE=0.5
+        PRIMARY_METRIC="accuracy_top1"
+        PRIMARY_METRIC_COL=4
+        BEST_METRIC_AWK="awk -F',' 'NR>1 {if(\$4+0 > max) {max=\$4+0; line=\$0}} END {print max, line}' \"\$LATEST/results.csv\""
+        ;;
+esac
+
+BASELINE_VALUE="${BASELINE:-none}"
+
+# ─── Generate dataset.yaml ───────────────────────────────────────────
+echo "[INFO] Creating dataset YAML..."
+mkdir -p "$ROOT_DIR/datasets/$NAME"
+
+if [ "$TASK" = "classify" ]; then
+    cat > "$DATASET_YAML_PATH" <<YAML_EOF
+path: $DATASET
+train: train
+val: val
+YAML_EOF
+elif [ "$TASK" = "pose" ]; then
+    KPT_NUM=$(echo "$KPT_SHAPE" | awk '{print $1}')
+    KPT_DIM=$(echo "$KPT_SHAPE" | awk '{print $2}')
+    {
+        echo "path: $DATASET"
+        echo "train: images/train"
+        echo "val: images/val"
+        echo ""
+        echo "kpt_shape: [$KPT_NUM, $KPT_DIM]"
+        echo ""
+        echo "names:"
+        echo "$CLASSES" | tr ',' '\n' | while IFS=: read -r idx cname; do
+            echo "  $idx: $cname"
+        done
+    } > "$DATASET_YAML_PATH"
+else
+    {
+        echo "path: $DATASET"
+        echo "train: images/train"
+        echo "val: images/val"
+        echo ""
+        echo "names:"
+        echo "$CLASSES" | tr ',' '\n' | while IFS=: read -r idx cname; do
+            echo "  $idx: $cname"
+        done
+    } > "$DATASET_YAML_PATH"
+fi
+
+echo "[INFO] Dataset YAML: $DATASET_YAML_PATH"
+
+# ─── Generate task-specific multi-line blocks ─────────────────────────
+TMPDIR=$(mktemp -d)
+trap "rm -rf $TMPDIR" EXIT
+
+# --- CLASSES block (for markdown) ---
+echo "$CLASSES" | tr ',' '\n' | while IFS=: read -r idx cname; do
+    echo "  - $idx: $cname"
+done > "$TMPDIR/classes.md"
+
+# --- DATASET_TABLE ---
+cat > "$TMPDIR/dataset_table.md" <<TABLE_EOF
+| Dataset | YAML | Train | Val | Total | Notes |
+|---------|------|-------|-----|-------|-------|
+| **$NAME** | \`$DATASET_YAML_PATH\` | $TRAIN_COUNT | $VAL_COUNT | $TOTAL_COUNT | Primary dataset |
+TABLE_EOF
+
+# --- BASELINE_SECTION ---
+if [ "$BASELINE_VALUE" = "none" ]; then
+    echo "No prior baseline. This is the first training session." > "$TMPDIR/baseline_section.md"
+else
+    cat > "$TMPDIR/baseline_section.md" <<BASE_EOF
+| Metric | Value | Notes |
+|--------|-------|-------|
+| $PRIMARY_METRIC | $BASELINE_VALUE | Previous best baseline — target to beat |
+BASE_EOF
+fi
+
+# --- RESULTS_CSV_COLUMNS ---
+case "$TASK" in
+    detect)
+        cat > "$TMPDIR/results_csv_columns.md" <<'COLS_EOF'
+```
+epoch, time,
+train/box_loss, train/cls_loss, train/dfl_loss,
+metrics/precision(B), metrics/recall(B), metrics/mAP50(B), metrics/mAP50-95(B),
+val/box_loss, val/cls_loss, val/dfl_loss,
+lr/pg0, lr/pg1, lr/pg2
+```
+
+**Key columns (1-indexed):**
+- `metrics/mAP50(B)` → primary quality signal (column 8)
+- `metrics/mAP50-95(B)` → stricter metric (column 9)
+- `metrics/precision(B)` → column 6
+- `metrics/recall(B)` → column 7
+- `train/box_loss` vs `val/box_loss` → overfitting gap
+COLS_EOF
+        ;;
+    obb)
+        cat > "$TMPDIR/results_csv_columns.md" <<'COLS_EOF'
+```
+epoch, time,
+train/box_loss, train/cls_loss, train/dfl_loss, train/angle_loss,
+metrics/precision(B), metrics/recall(B), metrics/mAP50(B), metrics/mAP50-95(B),
+val/box_loss, val/cls_loss, val/dfl_loss, val/angle_loss,
+lr/pg0, lr/pg1, lr/pg2
+```
+
+**Key columns (1-indexed):**
+- `metrics/mAP50(B)` → primary quality signal (column 9)
+- `metrics/mAP50-95(B)` → stricter metric (column 10)
+- `metrics/precision(B)` → column 7
+- `metrics/recall(B)` → column 8
+- `train/box_loss` vs `val/box_loss` → overfitting gap
+- `train/angle_loss` vs `val/angle_loss` → OBB rotation accuracy gap
+COLS_EOF
+        ;;
+    segment)
+        cat > "$TMPDIR/results_csv_columns.md" <<'COLS_EOF'
+```
+epoch, time,
+train/box_loss, train/cls_loss, train/dfl_loss, train/seg_loss,
+metrics/precision(B), metrics/recall(B), metrics/mAP50(B), metrics/mAP50-95(B),
+metrics/precision(M), metrics/recall(M), metrics/mAP50(M), metrics/mAP50-95(M),
+val/box_loss, val/cls_loss, val/dfl_loss, val/seg_loss,
+lr/pg0, lr/pg1, lr/pg2
+```
+
+**Key columns (1-indexed):**
+- `metrics/mAP50(M)` → primary mask quality signal (column 13)
+- `metrics/mAP50(B)` → box quality (column 9)
+- `train/seg_loss` vs `val/seg_loss` → mask overfitting gap
+- Monitor mAP50(M) vs mAP50(B) — they can diverge
+COLS_EOF
+        ;;
+    pose)
+        cat > "$TMPDIR/results_csv_columns.md" <<'COLS_EOF'
+```
+epoch, time,
+train/box_loss, train/cls_loss, train/dfl_loss, train/pose_loss,
+metrics/precision(B), metrics/recall(B), metrics/mAP50(B), metrics/mAP50-95(B),
+metrics/precision(P), metrics/recall(P), metrics/mAP50(P), metrics/mAP50-95(P),
+val/box_loss, val/cls_loss, val/dfl_loss, val/pose_loss,
+lr/pg0, lr/pg1, lr/pg2
+```
+
+**Key columns (1-indexed):**
+- `metrics/mAP50(P)` → primary pose quality signal (column 13)
+- `metrics/mAP50(B)` → box quality (column 9)
+- `train/pose_loss` vs `val/pose_loss` → keypoint overfitting gap
+COLS_EOF
+        ;;
+    classify)
+        cat > "$TMPDIR/results_csv_columns.md" <<'COLS_EOF'
+```
+epoch, time,
+train/loss,
+metrics/accuracy_top1, metrics/accuracy_top5,
+val/loss,
+lr/pg0, lr/pg1, lr/pg2
+```
+
+**Key columns (1-indexed):**
+- `metrics/accuracy_top1` → primary quality signal (column 4)
+- `metrics/accuracy_top5` → top-5 accuracy (column 5)
+- `train/loss` vs `val/loss` → overfitting gap
+COLS_EOF
+        ;;
+esac
+
+# --- TASK_CONSIDERATIONS ---
+case "$TASK" in
+    detect)
+        cat > "$TMPDIR/task_considerations.md" <<'TC_EOF'
+1. **box/cls/dfl loss balance** — monitor all three. If cls_loss converges fast but box_loss doesn't, localization is the bottleneck.
+2. **IMGSZ impact** — if original images are high-res, IMGSZ=1024 can dramatically improve detection of small objects.
+3. **Augmentation basics** — MOSAIC and SCALE are the most impactful. FLIPLR=0.5 is standard. Try DEGREES only if objects appear at varied rotations.
+4. **Single class vs multi-class** — for single-class, cls_loss should converge quickly. Focus on box_loss.
+TC_EOF
+        ;;
+    obb)
+        cat > "$TMPDIR/task_considerations.md" <<'TC_EOF'
+1. **angle_loss** is unique to OBB — track it alongside box_loss. If angle_loss plateaus or rises while box_loss falls, the model is losing rotation accuracy.
+2. **DEGREES augmentation** matters for OBB — rotation augmentation can help the model learn better orientation. Try 10-30 deg if not overfitting.
+3. **High-res images** — if original images are large, IMGSZ=1024 helps significantly. OBB needs precise corners.
+4. **Single class** means cls_loss should converge quickly — focus attention on box_loss and angle_loss.
+5. **Background images** (no labels) in the training set teach the model to not hallucinate detections.
+TC_EOF
+        ;;
+    segment)
+        cat > "$TMPDIR/task_considerations.md" <<'TC_EOF'
+1. **seg_loss** tracks mask quality separately from box quality. Monitor both.
+2. **COPY_PASTE augmentation** is especially powerful for segmentation — it creates new training examples by pasting object masks onto different backgrounds.
+3. **Monitor mAP50(M) vs mAP50(B)** — they can diverge. If box mAP is high but mask mAP is low, the model detects objects but segments them poorly.
+4. **If seg_loss > 5.0**, mask learning has collapsed — consider reducing augmentation or checking label quality.
+TC_EOF
+        ;;
+    pose)
+        cat > "$TMPDIR/task_considerations.md" <<'TC_EOF'
+1. **pose_loss** tracks keypoint accuracy. It should decrease steadily.
+2. **Be careful with aggressive geometric augmentation** — strong rotation (DEGREES) or perspective transforms can distort keypoint positions in labels.
+3. **Monitor mAP50(P)** for pose quality alongside mAP50(B) for detection quality.
+4. **kpt_shape must match the dataset** — verify keypoint count and dimensions are correct.
+5. **If pose_loss > 10.0**, keypoint learning has collapsed — check augmentation settings and label quality.
+TC_EOF
+        ;;
+    classify)
+        cat > "$TMPDIR/task_considerations.md" <<'TC_EOF'
+1. **Use accuracy_top1 as primary metric** (NOT mAP50). accuracy_top5 is useful for multi-class problems.
+2. **No bounding box concepts** — simpler loss landscape than detection tasks.
+3. **Watch for class imbalance** — check confusion matrix if some classes have much fewer images.
+4. **Augmentation focus**: HSV, erasing, mixup are most useful. Geometric transforms (mosaic, scale) are less relevant for classification.
+5. **train/loss vs val/loss gap** is the key overfitting indicator.
+TC_EOF
+        ;;
+esac
+
+# --- STOP_CONDITIONS ---
+case "$TASK" in
+    detect)
+        cat > "$TMPDIR/stop_conditions.md" <<'SC_EOF'
+- NaN in any loss column
+- val_box_loss increasing for 3+ consecutive runs (severe overfitting)
+- 6 consecutive runs with metric change < 0.01
+- GPU OOM persisting after reducing batch size
+- Dataset YAML missing or broken paths
+- Training job already running (PID alive)
+SC_EOF
+        ;;
+    obb)
+        cat > "$TMPDIR/stop_conditions.md" <<'SC_EOF'
+- NaN in any loss column
+- angle_loss > 0.1 (rotation learning has collapsed)
+- val_box_loss increasing for 3+ consecutive runs (severe overfitting)
+- 6 consecutive runs with metric change < 0.01
+- GPU OOM persisting after reducing batch size
+- Dataset YAML missing or broken paths
+- Training job already running (PID alive)
+SC_EOF
+        ;;
+    segment)
+        cat > "$TMPDIR/stop_conditions.md" <<'SC_EOF'
+- NaN in any loss column
+- seg_loss > 5.0 (mask learning has collapsed)
+- val_box_loss increasing for 3+ consecutive runs (severe overfitting)
+- 6 consecutive runs with metric change < 0.01
+- GPU OOM persisting after reducing batch size
+- Dataset YAML missing or broken paths
+- Training job already running (PID alive)
+SC_EOF
+        ;;
+    pose)
+        cat > "$TMPDIR/stop_conditions.md" <<'SC_EOF'
+- NaN in any loss column
+- pose_loss > 10.0 (keypoint learning has collapsed)
+- val_box_loss increasing for 3+ consecutive runs (severe overfitting)
+- 6 consecutive runs with metric change < 0.01
+- GPU OOM persisting after reducing batch size
+- Dataset YAML missing or broken paths
+- Training job already running (PID alive)
+SC_EOF
+        ;;
+    classify)
+        cat > "$TMPDIR/stop_conditions.md" <<'SC_EOF'
+- NaN in loss
+- val/loss increasing for 3+ consecutive runs (severe overfitting)
+- 6 consecutive runs with accuracy change < 0.01
+- GPU OOM persisting after reducing batch size
+- Dataset path missing or broken
+- Training job already running (PID alive)
+SC_EOF
+        ;;
+esac
+
+# --- NEXT_INSTRUCTION_METRICS (for next_instruction.md template) ---
+case "$TASK" in
+    detect)
+        echo '  mAP50: X.XX | mAP50-95: X.XX | P: X.XX | R: X.XX
+  val_box: X.XX | train_box: X.XX' > "$TMPDIR/next_instruction_metrics.md"
+        ;;
+    obb)
+        echo '  mAP50: X.XX | mAP50-95: X.XX | P: X.XX | R: X.XX
+  val_box: X.XX | train_box: X.XX | val_angle: X.XX | train_angle: X.XX' > "$TMPDIR/next_instruction_metrics.md"
+        ;;
+    segment)
+        echo '  mAP50(B): X.XX | mAP50(M): X.XX | P: X.XX | R: X.XX
+  val_box: X.XX | train_box: X.XX | val_seg: X.XX | train_seg: X.XX' > "$TMPDIR/next_instruction_metrics.md"
+        ;;
+    pose)
+        echo '  mAP50(B): X.XX | mAP50(P): X.XX | P: X.XX | R: X.XX
+  val_box: X.XX | train_box: X.XX | val_pose: X.XX | train_pose: X.XX' > "$TMPDIR/next_instruction_metrics.md"
+        ;;
+    classify)
+        echo '  accuracy_top1: X.XX | accuracy_top5: X.XX
+  train_loss: X.XX | val_loss: X.XX' > "$TMPDIR/next_instruction_metrics.md"
+        ;;
+esac
+
+# --- READ_METRICS_BLOCK (for hyperparameter strategy) ---
+case "$TASK" in
+    detect)
+        cat > "$TMPDIR/read_metrics_block.md" <<'RM_EOF'
+Extract from the **best epoch** (highest mAP50):
+```bash
+awk -F',' 'NR>1 {if($8+0 > max) {max=$8+0; ep=$1; line=$0}} END {print "best_epoch="ep, "best_mAP50="max}' "$LATEST/results.csv"
+```
+
+Key metrics:
+- **mAP50** = `metrics/mAP50(B)` — primary quality signal (column 8)
+- **mAP50-95** = `metrics/mAP50-95(B)` — stricter metric (column 9)
+- **Precision** = `metrics/precision(B)` (column 6)
+- **Recall** = `metrics/recall(B)` (column 7)
+- **train_box_loss** = `train/box_loss` (column 3)
+- **val_box_loss** = `val/box_loss` (column 10)
+
+Compute:
+- **Overfitting gap** = `val_box_loss - train_box_loss`
+- **Improvement** = current best mAP50 - previous run best mAP50
+- **Early stop?** = actual epochs trained < EPOCHS setting
+RM_EOF
+        ;;
+    obb)
+        cat > "$TMPDIR/read_metrics_block.md" <<'RM_EOF'
+Extract from the **best epoch** (highest mAP50):
+```bash
+awk -F',' 'NR>1 {if($9+0 > max) {max=$9+0; ep=$1; line=$0}} END {print "best_epoch="ep, "best_mAP50="max}' "$LATEST/results.csv"
+```
+
+Key metrics:
+- **mAP50** = `metrics/mAP50(B)` — primary quality signal (column 9)
+- **mAP50-95** = `metrics/mAP50-95(B)` — stricter metric (column 10)
+- **Precision** = `metrics/precision(B)` (column 7)
+- **Recall** = `metrics/recall(B)` (column 8)
+- **train_box_loss** = `train/box_loss` (column 3)
+- **val_box_loss** = `val/box_loss` (column 11)
+- **train_angle_loss** = `train/angle_loss` (column 6) — **OBB-specific**
+- **val_angle_loss** = `val/angle_loss` (column 14) — **OBB-specific**
+
+Compute:
+- **Overfitting gap** = `val_box_loss - train_box_loss`
+- **Angle health** = val_angle_loss trend — should be decreasing or stable
+- **Improvement** = current best mAP50 - previous run best mAP50
+- **Early stop?** = actual epochs trained < EPOCHS setting
+RM_EOF
+        ;;
+    segment)
+        cat > "$TMPDIR/read_metrics_block.md" <<'RM_EOF'
+Extract from the **best epoch** (highest mAP50(M)):
+```bash
+awk -F',' 'NR>1 {if($13+0 > max) {max=$13+0; ep=$1; line=$0}} END {print "best_epoch="ep, "best_mAP50_M="max}' "$LATEST/results.csv"
+```
+
+Key metrics:
+- **mAP50(M)** = `metrics/mAP50(M)` — primary mask quality (column 13)
+- **mAP50(B)** = `metrics/mAP50(B)` — box quality (column 9)
+- **train_seg_loss** = `train/seg_loss` (column 6)
+- **val_seg_loss** = `val/seg_loss` — mask overfitting
+
+Compute:
+- **Overfitting gap** = `val_box_loss - train_box_loss` (and seg_loss gap)
+- **Box vs mask divergence** = mAP50(B) - mAP50(M)
+- **Improvement** = current best mAP50(M) - previous run best
+- **Early stop?** = actual epochs trained < EPOCHS setting
+RM_EOF
+        ;;
+    pose)
+        cat > "$TMPDIR/read_metrics_block.md" <<'RM_EOF'
+Extract from the **best epoch** (highest mAP50(P)):
+```bash
+awk -F',' 'NR>1 {if($13+0 > max) {max=$13+0; ep=$1; line=$0}} END {print "best_epoch="ep, "best_mAP50_P="max}' "$LATEST/results.csv"
+```
+
+Key metrics:
+- **mAP50(P)** = `metrics/mAP50(P)` — primary pose quality (column 13)
+- **mAP50(B)** = `metrics/mAP50(B)` — box quality (column 9)
+- **train_pose_loss** = `train/pose_loss` (column 6)
+- **val_pose_loss** — pose overfitting
+
+Compute:
+- **Overfitting gap** = `val_box_loss - train_box_loss` (and pose_loss gap)
+- **Improvement** = current best mAP50(P) - previous run best
+- **Early stop?** = actual epochs trained < EPOCHS setting
+RM_EOF
+        ;;
+    classify)
+        cat > "$TMPDIR/read_metrics_block.md" <<'RM_EOF'
+Extract from the **best epoch** (highest accuracy_top1):
+```bash
+awk -F',' 'NR>1 {if($4+0 > max) {max=$4+0; ep=$1; line=$0}} END {print "best_epoch="ep, "best_acc="max}' "$LATEST/results.csv"
+```
+
+Key metrics:
+- **accuracy_top1** = `metrics/accuracy_top1` — primary quality signal (column 4)
+- **accuracy_top5** = `metrics/accuracy_top5` (column 5)
+- **train_loss** = `train/loss` (column 3)
+- **val_loss** = `val/loss` (column 6)
+
+Compute:
+- **Overfitting gap** = `val_loss - train_loss`
+- **Improvement** = current best accuracy - previous run best
+- **Early stop?** = actual epochs trained < EPOCHS setting
+RM_EOF
+        ;;
+esac
+
+# --- DIAGNOSE_TABLE ---
+case "$TASK" in
+    classify)
+        cat > "$TMPDIR/diagnose_table.md" <<'DT_EOF'
+| Condition | Diagnosis |
+|-----------|-----------|
+| accuracy < 0.50 | Model is struggling — needs more epochs, LR adjustment, or augmentation |
+| accuracy 0.50–0.70 | Moderate — try LR schedule, augmentation, or model swap |
+| accuracy 0.70–0.85 | Good — fine-tune with lower LR, more epochs |
+| accuracy 0.85–0.95 | Strong — small LR, careful not to overfit |
+| accuracy > 0.95 | Excellent — near ceiling. Micro-adjustments only |
+| val_loss >> train_loss (gap > 1.0) | Overfitting — increase augmentation, weight_decay |
+| val_loss ≈ train_loss | Good fit — can try more capacity (epochs, model size) |
+| Patience triggered (epochs < EPOCHS) | Converged early — increase PATIENCE or try LR warmup |
+| NaN in loss | **STOP** — do not launch next run |
+DT_EOF
+        ;;
+    *)
+        cat > "$TMPDIR/diagnose_table.md" <<'DT_EOF'
+| Condition | Diagnosis |
+|-----------|-----------|
+| mAP50 < 0.50 | Model is struggling — needs more epochs, LR adjustment, or augmentation tuning |
+| mAP50 0.50–0.70 | Moderate — room for improvement, try LR schedule, augmentation, or model swap |
+| mAP50 0.70–0.80 | Good — close to typical. Fine-tune with lower LR |
+| mAP50 0.80–0.85 | Strong — beating typical. Small LR, more epochs, careful not to overfit |
+| mAP50 > 0.85 | Excellent — near ceiling for dataset. Micro-adjustments only |
+| val_box_loss >> train_box_loss (gap > 1.0) | Overfitting — increase augmentation, weight_decay, reduce epochs |
+| val_box_loss ≈ train_box_loss | Good fit — can try more capacity (epochs, model size, imgsz) |
+| Precision high, Recall low | Missing objects — try more augmentation, lower LR, or more epochs |
+| Precision low, Recall high | False positives — possible label noise. Consider switching dataset |
+| Patience triggered (epochs < EPOCHS) | Converged early — increase PATIENCE, or try LR warmup restart |
+| NaN in any loss | **STOP** — do not launch next run |
+DT_EOF
+        ;;
+esac
+
+# --- AUGMENTATION_GUIDANCE ---
+case "$TASK" in
+    obb)
+        cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
+```bash
+# Enable rotation augmentation (OBB-specific advantage)
+sed -i 's/^DEGREES=.*/DEGREES=15.0/' ./train.sh
+
+# Stronger rotation for more variety
+sed -i 's/^DEGREES=.*/DEGREES=30.0/' ./train.sh
+
+# Enable flips (if defects have no preferred orientation)
+sed -i 's/^FLIPLR=.*/FLIPLR=0.5/' ./train.sh
+sed -i 's/^FLIPUD=.*/FLIPUD=0.5/' ./train.sh
+
+# Close mosaic later for cleaner convergence
+sed -i 's/^CLOSE_MOSAIC=.*/CLOSE_MOSAIC=15/' ./train.sh
+```
+
+**OBB augmentation notes:**
+- `DEGREES` is especially powerful for OBB — it teaches the model to handle arbitrary rotations
+- Start with 15 deg, increase to 30 if not overfitting
+- Don't exceed 45 deg without verifying it makes sense for the objects
+AG_EOF
+        ;;
+    segment)
+        cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
+```bash
+# COPY_PASTE is powerful for segmentation
+sed -i 's/^COPY_PASTE=.*/COPY_PASTE=0.2/' ./train.sh
+
+# Mixup for regularization
+sed -i 's/^MIXUP=.*/MIXUP=0.1/' ./train.sh
+
+# HSV for lighting variation
+sed -i 's/^HSV_H=.*/HSV_H=0.02/' ./train.sh
+sed -i 's/^HSV_S=.*/HSV_S=0.5/' ./train.sh
+```
+
+**Segment augmentation notes:**
+- `COPY_PASTE` is the most powerful augmentation for segmentation tasks
+- Creates new training examples by pasting object masks onto different backgrounds
+AG_EOF
+        ;;
+    pose)
+        cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
+```bash
+# Be careful with DEGREES — can distort keypoint positions
+sed -i 's/^DEGREES=.*/DEGREES=10.0/' ./train.sh
+
+# HSV for lighting variation
+sed -i 's/^HSV_V=.*/HSV_V=0.3/' ./train.sh
+
+# Scale variation
+sed -i 's/^SCALE=.*/SCALE=0.5/' ./train.sh
+```
+
+**Pose augmentation notes:**
+- Be cautious with `DEGREES` — large rotation can distort keypoint labels
+- Keep `DEGREES` ≤ 15 for pose tasks
+- `SCALE` and `TRANSLATE` are safe augmentations for pose
+AG_EOF
+        ;;
+    classify)
+        cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
+```bash
+# HSV for lighting variation
+sed -i 's/^HSV_H=.*/HSV_H=0.02/' ./train.sh
+sed -i 's/^HSV_S=.*/HSV_S=0.5/' ./train.sh
+sed -i 's/^HSV_V=.*/HSV_V=0.3/' ./train.sh
+
+# Erasing for regularization
+sed -i 's/^ERASING=.*/ERASING=0.5/' ./train.sh
+
+# Mixup for regularization
+sed -i 's/^MIXUP=.*/MIXUP=0.2/' ./train.sh
+```
+
+**Classify augmentation notes:**
+- Focus on HSV, erasing, and mixup — geometric transforms are less relevant
+- Mosaic and scale don't apply meaningfully to classification
+AG_EOF
+        ;;
+    *)
+        cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
+```bash
+# Rotation augmentation (if objects appear at varied orientations)
+sed -i 's/^DEGREES=.*/DEGREES=15.0/' ./train.sh
+
+# Flips
+sed -i 's/^FLIPLR=.*/FLIPLR=0.5/' ./train.sh
+sed -i 's/^FLIPUD=.*/FLIPUD=0.5/' ./train.sh
+
+# Mosaic and mixup
+sed -i 's/^MOSAIC=.*/MOSAIC=1.0/' ./train.sh
+sed -i 's/^MIXUP=.*/MIXUP=0.1/' ./train.sh
+
+# Close mosaic later for cleaner convergence
+sed -i 's/^CLOSE_MOSAIC=.*/CLOSE_MOSAIC=15/' ./train.sh
+```
+AG_EOF
+        ;;
+esac
+
+# --- DATASET_SWITCH_GUIDANCE ---
+echo "Currently only one dataset configured. To add more datasets, create additional YAML files in \`$ROOT_DIR/datasets/$NAME/\` and update this section." > "$TMPDIR/dataset_switch_guidance.md"
+
+# --- DECISION_TREE ---
+cat > "$TMPDIR/decision_tree.md" <<DT2_EOF
+\`\`\`
+START: Read \`## Verified facts\` and \`## Run history\` from your prompt.
+  │
+  ├─ Is this the first run (cold start)?
+  │   YES → Use defaults in train.sh (pretrained model, lr=0.01, epochs=100)
+  │
+  ├─ Did training fail (no results.csv, NaN loss)?
+  │   YES → Check current.log for OOM → Action E (batch=-1)
+  │         Check for NaN → STOP
+  │
+  ├─ $PRIMARY_METRIC < 0.50?
+  │   YES → Run count < 3?
+  │         YES → Action A (try lr=0.02) + Action B (epochs=200)
+  │         NO  → Action C (swap model architecture)
+  │
+  ├─ Overfitting (val_loss - train_loss > 1.0)?
+  │   YES → Action D (fight overfitting)
+  │
+  ├─ $PRIMARY_METRIC improved by > 0.02 from last run?
+  │   YES → Keep same strategy. Use best.pt (Action F).
+  │         Maybe increase epochs (Action B, within 50-500 bound).
+  │
+  ├─ $PRIMARY_METRIC plateaued (< 0.01 improvement for 2+ runs)?
+  │   YES → Which lever hasn't been tried?
+  │         ├─ LR not reduced → Action A (halve LR)
+  │         ├─ IMGSZ still 640 → Action G (try 1024)
+  │         ├─ Model not swapped → Action C (try different arch)
+  │         ├─ Optimizer not changed → Action J (try AdamW)
+  │         └─ All tried → STOP. Plateau across all levers usually means
+  │                       data is the limit. Collect more labels / audit
+  │                       label quality / add holdout test set.
+  │
+  └─ Otherwise → Fine-tune: Action A (lower LR) + Action F (best.pt) + Action B (more epochs)
+\`\`\`
+DT2_EOF
+
+# ─── Template filling ────────────────────────────────────────────────
+echo "[INFO] Filling templates..."
+mkdir -p "$PROJECT_DIR"
+# .claude/ is only needed in claude-CLI mode (for the PreToolUse hook).
+# Agent mode has no use for it (the guard runs as a subprocess from
+# run_agent.py instead).
+if [ "$LOOP_MODE" = "claude" ]; then
+    mkdir -p "$PROJECT_DIR/.claude"
+fi
+
+# Common templates scaffolded in both modes
+COMMON_TMPLS=("train.sh" "yolo_folder_skill.md" "hyperparameter_strategy.md" ".gitignore")
+
+# Mode-specific orchestrator templates (P6):
+#   claude → start_claude.sh + .claude/settings.json (PreToolUse hook)
+#   agent  → start_agent.sh + agent.env (run_agent.py picks the LLM)
+# Both modes share train.sh; train.sh prefers start_agent.sh if it exists.
+case "$LOOP_MODE" in
+    claude) MODE_TMPLS=("start_claude.sh") ;;
+    agent)  MODE_TMPLS=("start_agent.sh" "agent.env") ;;
+    *)      echo "ERROR: --mode must be 'claude' or 'agent' (got '$LOOP_MODE')" >&2; exit 1 ;;
+esac
+
+for tmpl in "${COMMON_TMPLS[@]}" "${MODE_TMPLS[@]}"; do
+    TMPL_FILE="$TEMPLATES_DIR/${tmpl}.tmpl"
+    OUT_FILE="$PROJECT_DIR/$tmpl"
+    if [ ! -f "$TMPL_FILE" ]; then
+        echo "WARN: Template not found: $TMPL_FILE"
+        continue
+    fi
+    cp "$TMPL_FILE" "$OUT_FILE"
+done
+
+# .claude/settings.json (Claude-CLI hook) is only meaningful for `claude`
+# mode. In agent mode, the bash guard runs as a subprocess from
+# run_agent.py — no .claude/ dir needed.
+if [ "$LOOP_MODE" = "claude" ]; then
+    SETTINGS_TMPL="$TEMPLATES_DIR/settings.json.tmpl"
+    if [ ! -f "$SETTINGS_TMPL" ]; then
+        echo "ERROR: $SETTINGS_TMPL is missing — guard hook will not be installed." >&2
+        exit 1
+    fi
+    cp "$SETTINGS_TMPL" "$PROJECT_DIR/.claude/settings.json"
+fi
+
+# First pass: multi-line blocks via sed r/d
+for f in "$PROJECT_DIR/yolo_folder_skill.md" "$PROJECT_DIR/hyperparameter_strategy.md"; do
+    [ -f "$f" ] || continue
+
+    for block_name in CLASSES DATASET_TABLE BASELINE_SECTION RESULTS_CSV_COLUMNS TASK_CONSIDERATIONS STOP_CONDITIONS NEXT_INSTRUCTION_METRICS BEST_METRIC_AWK READ_METRICS_BLOCK DIAGNOSE_TABLE AUGMENTATION_GUIDANCE DATASET_SWITCH_GUIDANCE DECISION_TREE; do
+        block_key=$(echo "$block_name" | tr '[:upper:]' '[:lower:]')
+        block_file="$TMPDIR/${block_key}.md"
+        if [ -f "$block_file" ]; then
+            sed -i -e "/{{${block_name}}}/{r ${block_file}" -e "d}" "$f"
+        fi
+    done
+done
+
+# Also handle BEST_METRIC_AWK in folder skill (it's a single-line but contains special chars)
+echo "$BEST_METRIC_AWK" > "$TMPDIR/best_metric_awk.md"
+sed -i -e "/{{BEST_METRIC_AWK}}/{r ${TMPDIR}/best_metric_awk.md" -e "d}" "$PROJECT_DIR/yolo_folder_skill.md"
+
+# Second pass: single-line placeholders (use | delimiter for paths)
+for f in "$PROJECT_DIR"/*; do
+    [ -f "$f" ] || continue
+    sed -i "s|{{PROJECT_NAME}}|${NAME}|g" "$f"
+    sed -i "s|{{TASK}}|${TASK}|g" "$f"
+    sed -i "s|{{VENV_PATH}}|${VENV_PATH}|g" "$f"
+    sed -i "s|{{MODELS_DIR}}|${MODELS_DIR}|g" "$f"
+    sed -i "s|{{RUNS_DIR}}|${RUNS_DIR}|g" "$f"
+    sed -i "s|{{PROJECT_DIR}}|${PROJECT_DIR}|g" "$f"
+    sed -i "s|{{DATASET_YAML}}|${DATASET_YAML_PATH}|g" "$f"
+    sed -i "s|{{PRIMARY_MODEL}}|${MODEL}|g" "$f"
+    sed -i "s|{{FALLBACK_MODEL}}|${FALLBACK}|g" "$f"
+    sed -i "s|{{PRIMARY_METRIC}}|${PRIMARY_METRIC}|g" "$f"
+    sed -i "s|{{IMGSZ}}|${IMGSZ}|g" "$f"
+    sed -i "s|{{DEVICE}}|${DEVICE}|g" "$f"
+    sed -i "s|{{MAX_ROUNDS}}|${MAX_ROUNDS}|g" "$f"
+    sed -i "s|{{BASELINE_VALUE}}|${BASELINE_VALUE}|g" "$f"
+    sed -i "s|{{IMAGE_INFO}}|${IMAGE_INFO}|g" "$f"
+    sed -i "s|{{CLASSES}}|${CLASSES}|g" "$f"
+    sed -i "s|{{NUM_CLASSES}}|${NUM_CLASSES}|g" "$f"
+    sed -i "s|{{DEGREES}}|${DEGREES}|g" "$f"
+    sed -i "s|{{FLIPUD}}|${FLIPUD}|g" "$f"
+    sed -i "s|{{FLIPLR}}|${FLIPLR}|g" "$f"
+    sed -i "s|{{MOSAIC}}|${MOSAIC}|g" "$f"
+    sed -i "s|{{MIXUP}}|${MIXUP}|g" "$f"
+    sed -i "s|{{COPY_PASTE}}|${COPY_PASTE}|g" "$f"
+    sed -i "s|{{ERASING}}|${ERASING}|g" "$f"
+    sed -i "s|{{SCALE}}|${SCALE}|g" "$f"
+    sed -i "s|{{ROOT_DIR}}|${ROOT_DIR}|g" "$f"
+    # P6 multi-LLM agent fields
+    sed -i "s|{{LLM_PROVIDER}}|${LLM_PROVIDER}|g" "$f"
+    sed -i "s|{{LLM_MODEL}}|${LLM_MODEL}|g" "$f"
+done
+
+# settings.json is in .claude/ (claude mode only) so the per-file loop misses it.
+if [ "$LOOP_MODE" = "claude" ]; then
+    sed -i "s|{{ROOT_DIR}}|${ROOT_DIR}|g" "$PROJECT_DIR/.claude/settings.json"
+fi
+
+# Append optional LLM_API_BASE when scaffolding agent mode with custom endpoint
+if [ "$LOOP_MODE" = "agent" ] && [ -n "$LLM_API_BASE" ]; then
+    echo "LLM_API_BASE=\"$LLM_API_BASE\"" >> "$PROJECT_DIR/agent.env"
+fi
+
+# Make shell scripts executable — only the one(s) for the chosen mode
+chmod +x "$PROJECT_DIR/train.sh"
+[ -f "$PROJECT_DIR/start_claude.sh" ] && chmod +x "$PROJECT_DIR/start_claude.sh"
+[ -f "$PROJECT_DIR/start_agent.sh" ]  && chmod +x "$PROJECT_DIR/start_agent.sh"
+
+# ─── Verify no unreplaced placeholders ────────────────────────────────
+LEFTOVER=$(grep -rn '{{[A-Z_]*}}' "$PROJECT_DIR/" 2>/dev/null | grep -v '\.log' | grep -v 'next_instruction' || true)
+if [ -n "$LEFTOVER" ]; then
+    echo ""
+    echo "ERROR: Unreplaced placeholders found:"
+    echo "$LEFTOVER"
+    exit 1
+fi
+
+# ─── Post-scaffolding output ─────────────────────────────────────────
+echo ""
+echo "========================================"
+echo "Project '$NAME' scaffolded successfully!"
+echo "========================================"
+echo ""
+echo "Files:"
+ls -la "$PROJECT_DIR/"
+echo ""
+echo "Dataset:"
+cat "$DATASET_YAML_PATH"
+echo ""
+echo "Model: $MODELS_DIR/$MODEL"
+echo ""
+
+echo "Syntax check..."
+bash -n "$PROJECT_DIR/train.sh" && echo "  train.sh: OK" || echo "  train.sh: SYNTAX ERROR"
+if [ "$LOOP_MODE" = "agent" ]; then
+    bash -n "$PROJECT_DIR/start_agent.sh" && echo "  start_agent.sh: OK" || echo "  start_agent.sh: SYNTAX ERROR"
+    LAUNCH_SCRIPT="start_agent.sh"
+else
+    bash -n "$PROJECT_DIR/start_claude.sh" && echo "  start_claude.sh: OK" || echo "  start_claude.sh: SYNTAX ERROR"
+    LAUNCH_SCRIPT="start_claude.sh"
+fi
+
+echo ""
+echo "To start training:"
+echo "  cd $PROJECT_DIR && bash $LAUNCH_SCRIPT"
+if [ "$LOOP_MODE" = "agent" ]; then
+    echo ""
+    echo "Agent config: $PROJECT_DIR/agent.env (provider=$LLM_PROVIDER, model=$LLM_MODEL)"
+    echo "Make sure the appropriate API key env var is set (see comments in agent.env)."
+fi
+echo ""
+echo "To monitor:"
+echo "  tail -f $PROJECT_DIR/current.log"
+echo "  PID=\$(cat $PROJECT_DIR/train.pid); kill -0 \$PID && echo running || echo done"
+echo ""
+echo "To stop:"
+echo "  kill \$(cat $PROJECT_DIR/train.pid)"

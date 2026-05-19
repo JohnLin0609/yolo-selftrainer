@@ -1,0 +1,235 @@
+# YOLO {{TASK}} Self-Trainer Folder Skill
+
+## Environment
+
+- **Python venv**: `{{VENV_PATH}}` — already has ultralytics + torch
+- **Activation**: `source {{VENV_PATH}}/bin/activate`
+- **DO NOT run pip install ultralytics** — it is already installed (v8.4.23)
+- train.sh and start_claude.sh / start_agent.sh all activate this venv automatically
+
+## Project Context
+
+This is a **{{PROJECT_NAME}}** project.
+
+- **Task**: {{TASK}} — use `yolo {{TASK}} train`
+- **Classes**:
+{{CLASSES}}
+- **Images**: {{IMAGE_INFO}}
+
+## Datasets
+
+{{DATASET_TABLE}}
+
+## Pretrained Models
+
+All in `{{MODELS_DIR}}/`:
+
+| Model | Path | Notes |
+|-------|------|-------|
+| **{{PRIMARY_MODEL}}** | `{{MODELS_DIR}}/{{PRIMARY_MODEL}}` | Primary model. Start here. |
+| **{{FALLBACK_MODEL}}** | `{{MODELS_DIR}}/{{FALLBACK_MODEL}}` | Fallback if primary plateaus. |
+
+## Previous Baseline
+
+{{BASELINE_SECTION}}
+
+## Project Layout
+
+```
+{{PROJECT_DIR}}/                        ← scripts & config live here
+├── start_claude.sh
+├── train.sh                            # Edit params with sed
+├── hyperparameter_strategy.md
+├── yolo_folder_skill.md
+├── next_instruction.md                 # Memory between sessions
+├── train.pid                           # PID of running training job
+└── current.log                         # Stdout/stderr of current training
+
+{{RUNS_DIR}}/{{TASK}}/                  ← training outputs go here
+└── YYYYMMDD_HHMMSS_claude_MODEL/
+    ├── results.csv                     # Epoch-by-epoch metrics
+    ├── args.yaml                       # Hyperparameters used
+    └── weights/
+        ├── best.pt                     # Best checkpoint
+        └── last.pt                     # Last checkpoint
+```
+
+## results.csv Columns
+
+> Column indices verified against ultralytics 8.4.23. Verify with `head -1 results.csv` on first run.
+
+{{RESULTS_CSV_COLUMNS}}
+
+## Find the Latest Run
+
+```bash
+LATEST=$(ls -td {{RUNS_DIR}}/{{TASK}}/*/ 2>/dev/null | head -1)
+```
+
+## Read Results
+
+```bash
+# Header
+head -1 "$LATEST/results.csv"
+# Last 5 epochs
+tail -5 "$LATEST/results.csv"
+# Best primary metric epoch
+{{BEST_METRIC_AWK}}
+# Check total epochs trained (if < EPOCHS, patience triggered early stop)
+tail -1 "$LATEST/results.csv" | cut -d',' -f1
+```
+
+## Check Params Used
+
+```bash
+cat "$LATEST/args.yaml"
+```
+
+## Find Best Weights
+
+```bash
+BEST_PT="$LATEST/weights/best.pt"
+[ -f "$BEST_PT" ] && echo "Found: $BEST_PT" || echo "NOT FOUND"
+```
+
+## Edit train.sh (ALWAYS use sed, NEVER rewrite the file)
+
+```bash
+# Learning rate
+sed -i 's/^LR=.*/LR=0.005/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^LR_FINAL=.*/LR_FINAL=0.005/' {{PROJECT_DIR}}/train.sh
+
+# Epochs and patience
+sed -i 's/^EPOCHS=.*/EPOCHS=150/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^PATIENCE=.*/PATIENCE=40/' {{PROJECT_DIR}}/train.sh
+
+# Model weights (pretrained or previous best.pt)
+sed -i 's|^WEIGHTS=.*|WEIGHTS=${1:-"{{MODELS_DIR}}/{{FALLBACK_MODEL}}"}|' {{PROJECT_DIR}}/train.sh
+
+# Optimizer
+sed -i 's/^OPTIMIZER=.*/OPTIMIZER="AdamW"/' {{PROJECT_DIR}}/train.sh
+
+# Image size
+sed -i 's/^IMGSZ=.*/IMGSZ=1024/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^BATCH=.*/BATCH=-1/' {{PROJECT_DIR}}/train.sh
+```
+
+## Verify Edits
+
+```bash
+grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER|MOSAIC|MIXUP|DEGREES|DATASET)=' {{PROJECT_DIR}}/train.sh
+```
+
+## Launch Training (ALWAYS detached)
+
+```bash
+nohup bash {{PROJECT_DIR}}/train.sh > {{PROJECT_DIR}}/current.log 2>&1 &
+echo $! > {{PROJECT_DIR}}/train.pid
+```
+
+**NEVER run train.sh without `nohup &`** — it blocks the session.
+
+When fine-tuning from a previous best.pt:
+```bash
+BEST_PT=$(ls -td {{RUNS_DIR}}/{{TASK}}/*/ | head -1)/weights/best.pt
+nohup bash {{PROJECT_DIR}}/train.sh "$BEST_PT" > {{PROJECT_DIR}}/current.log 2>&1 &
+echo $! > {{PROJECT_DIR}}/train.pid
+```
+
+## Check if Training is Already Running
+
+```bash
+PID=$(cat {{PROJECT_DIR}}/train.pid 2>/dev/null)
+kill -0 $PID 2>/dev/null && echo "Already running" || echo "Not running"
+```
+
+If already running: do **NOT** launch another. Exit immediately.
+
+## How the per-round prompt is built (read carefully)
+
+Each round, `scripts/build_prompt.py` constructs your prompt as three sections:
+
+1. **`## Verified facts (machine-extracted from events.jsonl)`** —
+   the authoritative numbers (best metric, trajectory, consecutive failures).
+   When facts disagree with prose, TRUST FACTS.
+
+2. **`## Run history`** — newest 3 runs in full, older runs collapsed to one
+   line each (Harness §6.4.1 micro-compaction). For deeper detail, read the
+   run dir's `results.csv` directly.
+
+3. **`## Claude's notes from previous round (FREE-FORM — may contain errors)`** —
+   the prose you (previous-self) wrote in `next_instruction.md`. Treat as
+   commentary and hypothesis, not source of truth.
+
+This means: **you don't need to repeat the run-history table in your prose**;
+`build_prompt.py` will strip any `## Run history & analysis` or
+`## Improvement trajectory` section you write (it duplicates the facts
+section and just wastes tokens).
+
+What your prose SHOULD contain:
+- Your current hypothesis about what's working / not working
+- Which Action(s) you applied this round and the reasoning
+- What you want next-self to try and WHY
+- Watch-outs not derivable from raw metrics (e.g., "ep190 crashed close_mosaic")
+
+## Write next_instruction.md (do this BEFORE every exit)
+
+This is the ONLY memory your next self has BEYOND the events.jsonl facts. Be
+specific about your reasoning; the numbers are already auto-extracted.
+
+**REQUIRED sections:**
+
+```
+---
+## Current training
+Run folder: <EXACT folder name, e.g., 20260320_170000_claude_v11>
+  Located at: {{RUNS_DIR}}/{{TASK}}/<folder_name>/
+  Status: IN PROGRESS (or COMPLETED if you read the final results)
+  Weights used: <full path to .pt file used>
+  Key params: epochs=X lr=X lrf=X batch=X imgsz=X patience=X optimizer=X
+  Augmentation: degrees=X mosaic=X mixup=X flipud=X fliplr=X erasing=X scale=X
+
+## Run history & analysis
+Run #1 — <folder_name> | <model> | <dataset>
+{{NEXT_INSTRUCTION_METRICS}}
+  Epochs trained: X/X (patience triggered? or full?)
+  Analysis: <what this result tells us — overfitting? underfitting? good fit?>
+  Decision: <what was changed and WHY based on the analysis>
+
+## Best result so far
+Best {{PRIMARY_METRIC}}: X.XX from run #N (<folder_name>)
+Best weights: {{RUNS_DIR}}/{{TASK}}/<folder_name>/weights/best.pt
+
+## Dataset
+Currently using: <which yaml> (<N> images)
+
+## What I already changed in train.sh
+<List EXACT sed commands already applied this round.>
+
+## Recommended action for next round
+<What the NEXT agent run (you, next round) should do, with reasoning.>
+
+## Next task
+1. Check if training <folder_name> is still running:
+   PID=$(cat {{PROJECT_DIR}}/train.pid 2>/dev/null)
+   kill -0 $PID 2>/dev/null && echo "Still running" || echo "Done"
+2. If still running: EXIT immediately, do not launch another.
+3. If done: read results from {{RUNS_DIR}}/{{TASK}}/<folder_name>/results.csv
+4. Compare with best result so far
+5. Check hyperparameter_strategy.md decision tree.
+6. Edit train.sh with sed. Launch training.
+7. Rewrite next_instruction.md with updated run history before exiting.
+
+## Watch out for
+- <specific anomalies>
+- <what to try next if current approach fails>
+---
+```
+
+## Task-Specific Considerations
+
+{{TASK_CONSIDERATIONS}}
+
+## Stop Conditions — Write STOP in next_instruction.md, do NOT launch training
+
+{{STOP_CONDITIONS}}

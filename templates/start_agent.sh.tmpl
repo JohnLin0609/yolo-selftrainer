@@ -1,0 +1,364 @@
+#!/bin/bash
+# Multi-LLM agent orchestrator (P6). Structurally mirrors start_claude.sh
+# but invokes scripts/run_agent.py instead of the `claude` CLI binary.
+# Do NOT use set -e — agent non-zero exit must not silently kill the loop.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV="{{VENV_PATH}}"
+FOLDER_SKILL="$SCRIPT_DIR/yolo_folder_skill.md"
+PARAM_SKILL="$SCRIPT_DIR/hyperparameter_strategy.md"
+INSTRUCTION="$SCRIPT_DIR/next_instruction.md"
+ROUND_FILE="$SCRIPT_DIR/round_counter"
+SESSION_FILE="$SCRIPT_DIR/session_id"
+LOGS_DIR="$SCRIPT_DIR/logs"
+MAX_ROUNDS={{MAX_ROUNDS}}   # ← change this to set how many training cycles to run
+
+# ─── Agent config (Harness §11 — synchronous + necessary) ───────────
+# agent.env defines LLM_PROVIDER / LLM_MODEL / optional LLM_API_BASE plus
+# any API_KEY env vars the chosen provider needs. Sourcing fails loud so
+# the user sees what's missing instead of getting a cryptic litellm error.
+AGENT_ENV="$SCRIPT_DIR/agent.env"
+if [ ! -f "$AGENT_ENV" ]; then
+  echo "[agent] ERROR: $AGENT_ENV is missing." >&2
+  echo "[agent]        agent mode requires LLM_PROVIDER, LLM_MODEL, and an API key" >&2
+  echo "[agent]        env var. Re-scaffold with: --mode agent --provider X --model Y" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+source "$AGENT_ENV"
+: "${LLM_PROVIDER:?[agent] LLM_PROVIDER must be set in $AGENT_ENV}"
+: "${LLM_MODEL:?[agent] LLM_MODEL must be set in $AGENT_ENV}"
+
+# ─── Circuit breaker check (Harness §6.4.5) ─────────────────────────
+if [ -f "$SCRIPT_DIR/HALTED" ]; then
+  echo "[agent] HALTED file present — loop will not run." >&2
+  echo "[agent] ----- $SCRIPT_DIR/HALTED -----" >&2
+  cat "$SCRIPT_DIR/HALTED" >&2
+  echo "[agent] -----------------------" >&2
+  exit 1
+fi
+
+# ─── Per-round preflight (Harness §十一) ────────────────────────────
+FRAMEWORK_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+if ! bash "$FRAMEWORK_ROOT/scripts/preflight.sh" --quick "$SCRIPT_DIR"; then
+  cat > "$SCRIPT_DIR/HALTED" <<HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') — preflight failed before round.
+Most likely: disk filled up or GPU is in use by another process.
+
+To resume after fixing:
+  rm $SCRIPT_DIR/HALTED
+  bash $SCRIPT_DIR/start_agent.sh
+HALT_EOF
+  python3 "$FRAMEWORK_ROOT/scripts/event.py" "$SCRIPT_DIR" emit preflight-failed \
+    --round 0 --reason "disk-or-gpu" || true
+  python3 "$FRAMEWORK_ROOT/scripts/event.py" "$SCRIPT_DIR" emit halted \
+    --reason preflight --details-json '{"check":"quick"}' || true
+  echo "[agent] preflight failed — wrote HALTED" >&2
+  exit 1
+fi
+
+# Activate the venv so run_agent.py + the Bash tool inherit it
+source "$VENV/bin/activate"
+
+# Verify litellm is installed (P6 dep)
+if ! python -c "import litellm" 2>/dev/null; then
+  echo "[agent] ERROR: litellm not installed in $VENV." >&2
+  echo "[agent]        Run: source $VENV/bin/activate && pip install 'litellm>=1.45,<2'" >&2
+  exit 1
+fi
+
+for f in "$FOLDER_SKILL" "$PARAM_SKILL"; do
+  if [ ! -f "$f" ]; then
+    echo "[agent] ERROR: missing $f"
+    exit 1
+  fi
+done
+
+# ─── Round counter ───────────────────────────────────────────────────
+ROUND=1
+if [ -f "$ROUND_FILE" ]; then
+  ROUND=$(cat "$ROUND_FILE")
+  if [ -f "$SCRIPT_DIR/train_completed" ]; then
+    ROUND=$((ROUND + 1))
+    rm -f "$SCRIPT_DIR/train_completed"
+  fi
+fi
+echo "$ROUND" > "$ROUND_FILE"
+
+# ─── Session ID ──────────────────────────────────────────────────────
+if [ "$ROUND" -eq 1 ] || [ ! -f "$SESSION_FILE" ]; then
+  SESSION_ID=$(date +%Y%m%d_%H%M%S)
+  echo "$SESSION_ID" > "$SESSION_FILE"
+else
+  SESSION_ID=$(cat "$SESSION_FILE")
+fi
+SESSION_LOG_DIR="$LOGS_DIR/$SESSION_ID"
+mkdir -p "$SESSION_LOG_DIR"
+
+rm -f "$SCRIPT_DIR/last_run_name"
+
+EVENT="python3 $FRAMEWORK_ROOT/scripts/event.py $SCRIPT_DIR"
+$EVENT emit round-started --round "$ROUND" --session-id "$SESSION_ID" || true
+
+echo "[agent] =============================="
+echo "[agent] Session: $SESSION_ID | Round $ROUND / $MAX_ROUNDS"
+echo "[agent] Provider: $LLM_PROVIDER | Model: $LLM_MODEL"
+
+if [ "$ROUND" -gt "$MAX_ROUNDS" ]; then
+  echo "[agent] MAX_ROUNDS ($MAX_ROUNDS) reached. Stopping loop."
+  echo "[agent] next_instruction.md preserved for future resume."
+  echo "[agent] Logs: $SESSION_LOG_DIR/"
+  echo "[agent] To continue: rm round_counter session_id && bash start_agent.sh"
+  echo "0" > "$ROUND_FILE"
+  rm -f "$SESSION_FILE"
+  exit 0
+fi
+
+# ─── Prepare temp log dir ────────────────────────────────────────────
+TEMP_LOG_DIR="$SESSION_LOG_DIR/round_${ROUND}_pending"
+mkdir -p "$TEMP_LOG_DIR"
+
+# ─── Build system + user prompts ────────────────────────────────────
+# System prompt and user prompt are written to files so run_agent.py can
+# read them directly (no shell quoting hell for long markdown).
+SYSTEM_FILE="$TEMP_LOG_DIR/system.md"
+USER_FILE="$TEMP_LOG_DIR/user.md"
+{
+  cat "$FOLDER_SKILL"
+  echo ""
+  echo "---"
+  echo ""
+  cat "$PARAM_SKILL"
+} > "$SYSTEM_FILE"
+
+# Final-round report generation (same as Claude mode)
+if [ "$ROUND" -eq "$MAX_ROUNDS" ]; then
+  REPORT_SCRIPT="$FRAMEWORK_ROOT/scripts/generate_report.py"
+  if [ -f "$REPORT_SCRIPT" ]; then
+    echo "[agent] Generating training report..."
+    if ! python3 "$REPORT_SCRIPT" \
+        --project-dir "$SCRIPT_DIR" \
+        --runs-dir "{{RUNS_DIR}}/{{TASK}}" \
+        --task "{{TASK}}" \
+        --output "$SCRIPT_DIR/training_report.md"; then
+      echo "[agent] WARN: training report generation failed (continuing — agent will still produce next_instruction.md)" >&2
+    fi
+  else
+    echo "[agent] WARN: report script missing at $REPORT_SCRIPT — final summary will be agent-only" >&2
+  fi
+fi
+
+if [ -f "$INSTRUCTION" ]; then
+  echo "[agent] Resuming via build_prompt.py (events.jsonl facts + prose)"
+  if ! python3 "$FRAMEWORK_ROOT/scripts/build_prompt.py" "$SCRIPT_DIR" \
+      --round "$ROUND" --max-rounds "$MAX_ROUNDS" > "$USER_FILE"; then
+    echo "[agent] WARN: build_prompt.py failed — falling back to raw next_instruction.md" >&2
+    {
+      echo "Round $ROUND of $MAX_ROUNDS."
+      echo ""
+      cat "$INSTRUCTION"
+    } > "$USER_FILE"
+  fi
+else
+  echo "[agent] Cold start"
+  cat > "$USER_FILE" <<COLD_EOF
+Round $ROUND of $MAX_ROUNDS.
+
+Cold start — {{PROJECT_NAME}} — {{TASK}} task.
+
+The framework already knows these facts (no need to discover):
+- Task type: {{TASK}}
+- Dataset YAML: {{DATASET_YAML}}
+- Primary model: {{MODELS_DIR}}/{{PRIMARY_MODEL}}
+- Initial IMGSZ: {{IMGSZ}} (auto-detected from source resolution)
+- venv {{VENV_PATH}} is already active; ultralytics 8.4.x installed.
+  Do NOT run pip install (blocked by safety guard).
+
+Your job this round — do these steps in order, ONE TOOL CALL AT A TIME:
+
+Step 1 — Sanity check ultralytics:
+  Call Bash with command:
+    python -c 'import ultralytics; print(ultralytics.__version__)'
+
+Step 2 — Show current train.sh params:
+  Call Bash with command:
+    grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER)=' $SCRIPT_DIR/train.sh
+
+Step 3 — Apply hyperparameter_strategy.md to pick first-run params.
+  Use simple sed commands like:
+    sed -i 's/^LR=.*/LR=0.01/' $SCRIPT_DIR/train.sh
+    sed -i 's/^EPOCHS=.*/EPOCHS=100/' $SCRIPT_DIR/train.sh
+    sed -i 's/^PATIENCE=.*/PATIENCE=50/' $SCRIPT_DIR/train.sh
+  ONE sed per Bash call. Do not chain.
+
+Step 4 — Verify your edits:
+  Call Bash:
+    grep -E '^(LR|EPOCHS|PATIENCE)=' $SCRIPT_DIR/train.sh
+
+Step 5 — Launch training in background:
+  Call Bash:
+    nohup bash $SCRIPT_DIR/train.sh > $SCRIPT_DIR/current.log 2>&1 & echo \$! > $SCRIPT_DIR/train.pid
+
+Step 6 — Use the Write tool to create $SCRIPT_DIR/next_instruction.md.
+  Format described in yolo_folder_skill.md.
+
+REMINDERS:
+- Every action above is a tool call (Bash or Write). Do NOT emit JSON text.
+- After step 6, give a one-line final text response and stop.
+- Use the structured tool_calls API, NOT inline JSON in text.
+COLD_EOF
+fi
+
+cp "$USER_FILE" "$TEMP_LOG_DIR/instruction.md"
+
+# ─── Run the agent ────────────────────────────────────────────────────
+# Trust boundary (Harness §5.1): the safety layer is the standalone bash
+# guard, called as a subprocess from inside run_agent.py for every Bash
+# tool invocation. Identical deny semantics to the Claude-CLI flow's
+# PreToolUse hook.
+AGENT_CLI=("python3" "$FRAMEWORK_ROOT/scripts/run_agent.py"
+  "--project"            "$SCRIPT_DIR"
+  "--provider"           "$LLM_PROVIDER"
+  "--model"              "$LLM_MODEL"
+  "--system-prompt-file" "$SYSTEM_FILE"
+  "--user-prompt-file"   "$USER_FILE"
+  "--guard-script"       "$FRAMEWORK_ROOT/scripts/claude_bash_guard.py"
+  "--stream-json-out"    "$TEMP_LOG_DIR/claude_raw.jsonl"
+  "--round"              "$ROUND"
+  "--session-id"         "$SESSION_ID"
+  "--max-turns"          "${LLM_MAX_TURNS:-50}"
+  "--tool-result-max-chars" "${LLM_TOOL_RESULT_MAX:-30000}"
+  "--bash-timeout"       "${LLM_BASH_TIMEOUT:-600}"
+)
+if [ -n "${LLM_API_BASE:-}" ]; then
+  AGENT_CLI+=("--api-base" "$LLM_API_BASE")
+fi
+
+AGENT_START_TS=$SECONDS
+if "${AGENT_CLI[@]}"; then
+  AGENT_EXIT=0
+else
+  AGENT_EXIT=$?
+fi
+AGENT_DURATION=$((SECONDS - AGENT_START_TS))
+# Note: run_agent.py itself emits claude-started + claude-finished events so
+# event semantics stay identical to Claude-CLI mode. The outer script does
+# NOT duplicate them — that would cause double counting on the consecutive-
+# failures derivation.
+
+# ─── Extract readable log from stream-json (identical to Claude mode) ──
+python3 -c "
+import json, sys
+for line in open('$TEMP_LOG_DIR/claude_raw.jsonl'):
+    line = line.strip()
+    if not line: continue
+    try: msg = json.loads(line)
+    except: continue
+    t = msg.get('type', '')
+    if t == 'assistant':
+        for block in msg.get('message', {}).get('content', []):
+            if block.get('type') == 'text':
+                print('--- AGENT ---')
+                print(block['text'])
+                print()
+            elif block.get('type') == 'tool_use':
+                name = block.get('name', '?')
+                inp = block.get('input', {})
+                if 'command' in inp:
+                    print(f'--- TOOL: {name} ---')
+                    print(f'  \$ {inp[\"command\"]}')
+                elif 'file_path' in inp:
+                    print(f'--- TOOL: {name} ---')
+                    print(f'  file: {inp[\"file_path\"]}')
+                    if 'content' in inp:
+                        print(f'  (write {len(inp[\"content\"])} chars)')
+                else:
+                    print(f'--- TOOL: {name} ---')
+                    print(f'  {json.dumps(inp)[:200]}')
+                print()
+    elif t == 'tool':
+        content = msg.get('content', '')
+        if isinstance(content, str) and content.strip():
+            lines = content.strip().split('\n')
+            if len(lines) > 30:
+                print('\n'.join(lines[:15]))
+                print(f'  ... ({len(lines)-30} lines omitted) ...')
+                print('\n'.join(lines[-15:]))
+            else:
+                print(content.strip())
+            print()
+    elif t == 'result':
+        cost = msg.get('total_cost_usd', 0)
+        dur = msg.get('duration_ms', 0)
+        turns = msg.get('num_turns', 0)
+        print(f'--- RESULT: {msg.get(\"subtype\",\"?\")} | {turns} turns | {dur/1000:.1f}s | \${cost:.4f} ---')
+        print()
+" > "$TEMP_LOG_DIR/claude_session.log"
+EXTRACT_EXIT=$?
+if [ "$EXTRACT_EXIT" -ne 0 ]; then
+  echo "[agent] WARN: log extractor exited $EXTRACT_EXIT — human-readable log may be incomplete." >&2
+  echo "[agent]       Raw stream-json is at $TEMP_LOG_DIR/claude_raw.jsonl" >&2
+fi
+
+# ─── Copy next_instruction.md into log folder ────────────────────────
+if [ -f "$INSTRUCTION" ]; then
+  if ! cp "$INSTRUCTION" "$TEMP_LOG_DIR/next_instruction.md"; then
+    echo "[agent] WARN: failed to snapshot next_instruction.md into log dir" >&2
+  fi
+fi
+
+# ─── Rename log folder to match run name ─────────────────────────────
+sleep 3
+if [ -f "$SCRIPT_DIR/last_run_name" ]; then
+  ACTUAL_RUN_NAME=$(cat "$SCRIPT_DIR/last_run_name")
+  FINAL_LOG_DIR="$SESSION_LOG_DIR/$ACTUAL_RUN_NAME"
+  if [ ! -d "$FINAL_LOG_DIR" ]; then
+    if mv "$TEMP_LOG_DIR" "$FINAL_LOG_DIR"; then
+      echo "[agent] Logs: $FINAL_LOG_DIR/"
+    else
+      echo "[agent] WARN: mv failed — logs remain at $TEMP_LOG_DIR/" >&2
+    fi
+  else
+    echo "[agent] WARN: $FINAL_LOG_DIR already exists, keeping $TEMP_LOG_DIR/" >&2
+  fi
+else
+  echo "[agent] Logs: $TEMP_LOG_DIR/ (no last_run_name — agent likely never launched training)"
+fi
+
+if [ $AGENT_EXIT -eq 0 ]; then
+  echo "[agent] Session complete."
+  if [ "$ROUND" -eq "$MAX_ROUNDS" ] && [ -f "$SCRIPT_DIR/training_report.md" ]; then
+    echo ""
+    echo "========================================"
+    echo "TRAINING REPORT"
+    echo "========================================"
+    cat "$SCRIPT_DIR/training_report.md"
+    echo ""
+    echo "Report saved to: $SCRIPT_DIR/training_report.md"
+  fi
+else
+  echo "[agent] ERROR: agent exited with code $AGENT_EXIT" >&2
+  echo "[agent] Preserving next_instruction.md for retry." >&2
+  FAILS=$(cat "$SCRIPT_DIR/consecutive_failures" 2>/dev/null)
+  case "$FAILS" in ''|*[!0-9]*) FAILS=0 ;; esac
+  FAILS=$((FAILS + 1))
+  echo "$FAILS" > "$SCRIPT_DIR/consecutive_failures"
+  if [ "$FAILS" -ge 3 ]; then
+    cat > "$SCRIPT_DIR/HALTED" <<HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') after $FAILS consecutive failures.
+Last failure: agent ($LLM_PROVIDER/$LLM_MODEL) exited with code $AGENT_EXIT in session $SESSION_ID round $ROUND.
+
+Inspect the raw stream-json for the root cause:
+  tail -200 $TEMP_LOG_DIR/claude_raw.jsonl
+  cat $TEMP_LOG_DIR/claude_session.log
+
+To resume after fixing:
+  rm $SCRIPT_DIR/HALTED $SCRIPT_DIR/consecutive_failures
+  bash $SCRIPT_DIR/start_agent.sh
+HALT_EOF
+    echo "[agent] CIRCUIT BREAKER TRIPPED — $FAILS consecutive failures. Wrote HALTED." >&2
+    $EVENT emit halted --reason circuit-breaker-agent \
+      --details-json "{\"consecutive_failures\": $FAILS, \"last_agent_exit\": $AGENT_EXIT, \"provider\": \"$LLM_PROVIDER\", \"model\": \"$LLM_MODEL\"}" || true
+  fi
+  exit 1
+fi

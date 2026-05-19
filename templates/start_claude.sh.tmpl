@@ -1,0 +1,347 @@
+#!/bin/bash
+# Do NOT use set -e — claude non-zero exit must not silently kill the loop
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV="{{VENV_PATH}}"
+FOLDER_SKILL="$SCRIPT_DIR/yolo_folder_skill.md"
+PARAM_SKILL="$SCRIPT_DIR/hyperparameter_strategy.md"
+INSTRUCTION="$SCRIPT_DIR/next_instruction.md"
+ROUND_FILE="$SCRIPT_DIR/round_counter"
+SESSION_FILE="$SCRIPT_DIR/session_id"
+LOGS_DIR="$SCRIPT_DIR/logs"
+MAX_ROUNDS={{MAX_ROUNDS}}   # ← change this to set how many training cycles to run
+
+# ─── Circuit breaker check (Harness §6.4.5) ─────────────────────────
+# If train.sh tripped the breaker (3 consecutive crashes), it wrote HALTED
+# and we refuse to run. The operator must inspect and clear it.
+if [ -f "$SCRIPT_DIR/HALTED" ]; then
+  echo "[claude] HALTED file present — loop will not run." >&2
+  echo "[claude] ----- $SCRIPT_DIR/HALTED -----" >&2
+  cat "$SCRIPT_DIR/HALTED" >&2
+  echo "[claude] -----------------------" >&2
+  exit 1
+fi
+
+# ─── Per-round preflight (Harness §十一) ────────────────────────────
+# Disk and GPU can become unavailable between rounds (other processes, full
+# disk, GPU reset). Cheap check; if it errors we halt the loop loudly rather
+# than spending a Claude session that will fail on launch.
+FRAMEWORK_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+if ! bash "$FRAMEWORK_ROOT/scripts/preflight.sh" --quick "$SCRIPT_DIR"; then
+  cat > "$SCRIPT_DIR/HALTED" <<HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') — preflight failed before round.
+Most likely: disk filled up or GPU is in use by another process.
+
+To resume after fixing:
+  rm $SCRIPT_DIR/HALTED
+  bash $SCRIPT_DIR/start_claude.sh
+HALT_EOF
+  python3 "$FRAMEWORK_ROOT/scripts/event.py" "$SCRIPT_DIR" emit preflight-failed \
+    --round 0 --reason "disk-or-gpu" || true
+  python3 "$FRAMEWORK_ROOT/scripts/event.py" "$SCRIPT_DIR" emit halted \
+    --reason preflight --details-json '{"check":"quick"}' || true
+  echo "[claude] preflight failed — wrote HALTED" >&2
+  exit 1
+fi
+
+# Activate the venv so Claude's Bash tool inherits it
+source "$VENV/bin/activate"
+
+for f in "$FOLDER_SKILL" "$PARAM_SKILL"; do
+  if [ ! -f "$f" ]; then
+    echo "[claude] ERROR: missing $f"
+    exit 1
+  fi
+done
+
+# ─── Round counter ───────────────────────────────────────────────────
+# Increment if train.sh just finished and set the train_completed flag.
+# Do NOT increment if Claude exited without launching training (e.g., training was still running).
+ROUND=1
+if [ -f "$ROUND_FILE" ]; then
+  ROUND=$(cat "$ROUND_FILE")
+  if [ -f "$SCRIPT_DIR/train_completed" ]; then
+    # train.sh just finished — this is a wakeup call, advance to next round
+    ROUND=$((ROUND + 1))
+    rm -f "$SCRIPT_DIR/train_completed"
+  fi
+fi
+echo "$ROUND" > "$ROUND_FILE"
+
+# ─── Session ID (timestamp folder for this batch of rounds) ──────────
+if [ "$ROUND" -eq 1 ] || [ ! -f "$SESSION_FILE" ]; then
+  SESSION_ID=$(date +%Y%m%d_%H%M%S)
+  echo "$SESSION_ID" > "$SESSION_FILE"
+else
+  SESSION_ID=$(cat "$SESSION_FILE")
+fi
+SESSION_LOG_DIR="$LOGS_DIR/$SESSION_ID"
+mkdir -p "$SESSION_LOG_DIR"
+
+# Clear stale last_run_name so we only pick up this round's training
+rm -f "$SCRIPT_DIR/last_run_name"
+
+# Event: this round has started. Source of truth for "what round are we on"
+# (round_counter file is just a cache for fast bash access).
+EVENT="python3 $FRAMEWORK_ROOT/scripts/event.py $SCRIPT_DIR"
+$EVENT emit round-started --round "$ROUND" --session-id "$SESSION_ID" || true
+
+echo "[claude] =============================="
+echo "[claude] Session: $SESSION_ID | Round $ROUND / $MAX_ROUNDS"
+
+if [ "$ROUND" -gt "$MAX_ROUNDS" ]; then
+  echo "[claude] MAX_ROUNDS ($MAX_ROUNDS) reached. Stopping loop."
+  echo "[claude] next_instruction.md preserved for future resume."
+  echo "[claude] Logs: $SESSION_LOG_DIR/"
+  echo "[claude] To continue: rm round_counter session_id && bash start_claude.sh"
+  echo "0" > "$ROUND_FILE"
+  rm -f "$SESSION_FILE"
+  exit 0
+fi
+
+# ─── Prepare temp log dir (renamed after Claude launches training) ───
+TEMP_LOG_DIR="$SESSION_LOG_DIR/round_${ROUND}_pending"
+mkdir -p "$TEMP_LOG_DIR"
+
+SYSTEM_PROMPT="$(cat "$FOLDER_SKILL")
+
+---
+
+$(cat "$PARAM_SKILL")"
+
+# ─── Build prompt (Harness §6 + §8 two-layer view) ──────────────────
+# Warm starts go through scripts/build_prompt.py which:
+#   1. extracts machine-verified facts from events.jsonl (best so far, run
+#      trajectory, consecutive failures)
+#   2. compacts old runs to one-liners (micro-compact — Harness §6.4.1)
+#   3. appends Claude's free-form notes from next_instruction.md, with the
+#      drop of auto-generated duplicate sections
+# Cold starts still use the hand-built heredoc below (build_prompt has no
+# facts to show on round 1; the cold-start instructions are orchestrator-
+# specific and don't belong in the prompt builder).
+#
+# Note: the "Round N-1 mandatory Action K" hardcode that lived here in P0 was
+# removed in P3 in favor of letting Claude reason from the trajectory shown
+# in the facts section. P5 will add an explicit convergence signal that
+# computes when Action K is actually warranted.
+if [ "$ROUND" -eq "$MAX_ROUNDS" ]; then
+  # Auto-generate training report at final round.
+  # Fail-loud (Harness §二) — if the report script breaks we want to know,
+  # because the final round is the operator's only summary of the session.
+  REPORT_SCRIPT="$FRAMEWORK_ROOT/scripts/generate_report.py"
+  if [ -f "$REPORT_SCRIPT" ]; then
+    echo "[claude] Generating training report..."
+    if ! python3 "$REPORT_SCRIPT" \
+        --project-dir "$SCRIPT_DIR" \
+        --runs-dir "{{RUNS_DIR}}/{{TASK}}" \
+        --task "{{TASK}}" \
+        --output "$SCRIPT_DIR/training_report.md"; then
+      echo "[claude] WARN: training report generation failed (continuing — Claude will still produce next_instruction.md)" >&2
+    fi
+  else
+    echo "[claude] WARN: report script missing at $REPORT_SCRIPT — final summary will be Claude-only" >&2
+  fi
+fi
+
+if [ -f "$INSTRUCTION" ]; then
+  echo "[claude] Resuming via build_prompt.py (events.jsonl facts + prose)"
+  if ! PROMPT=$(python3 "$FRAMEWORK_ROOT/scripts/build_prompt.py" "$SCRIPT_DIR" \
+      --round "$ROUND" --max-rounds "$MAX_ROUNDS"); then
+    # Fail-loud fallback (Harness §二): if the builder crashes, fall back to
+    # the raw next_instruction.md so the loop still progresses. Surface the
+    # crash on stderr so the operator can fix the builder.
+    echo "[claude] WARN: build_prompt.py failed — falling back to raw next_instruction.md" >&2
+    PROMPT="Round $ROUND of $MAX_ROUNDS.
+
+$(cat "$INSTRUCTION")"
+  fi
+  # Do NOT delete next_instruction.md yet — keep as fallback until Claude writes a new one
+else
+  echo "[claude] Cold start"
+  PROMPT="Round $ROUND of $MAX_ROUNDS.
+
+Cold start — {{PROJECT_NAME}} — {{TASK}} task.
+
+IMPORTANT: The virtualenv at {{VENV_PATH}} is already activated.
+ultralytics is already installed there. Do NOT run pip install.
+
+Do the following in order:
+1. Verify ultralytics is available:
+   python -c 'import ultralytics; print(ultralytics.__version__)'
+2. Validate the dataset YAML from train.sh:
+   DATASET_PATH=\$(grep '^DATASET=' $SCRIPT_DIR/train.sh | cut -d'\"' -f2)
+   cat \"\$DATASET_PATH\"
+   ls \$(grep '^path:' \"\$DATASET_PATH\" | awk '{print \$2}')/images/train/ | wc -l
+3. Check current train.sh params:
+   grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER|DATASET)=' $SCRIPT_DIR/train.sh
+4. Apply hyperparameter_strategy.md to pick starting params for first run.
+   This is {{TASK}} task — model should be {{PRIMARY_MODEL}}.
+   Edit train.sh with sed as needed. Verify edits with grep.
+5. Launch detached:
+   nohup bash $SCRIPT_DIR/train.sh > $SCRIPT_DIR/current.log 2>&1 &
+   echo \$! > $SCRIPT_DIR/train.pid
+6. Write next_instruction.md (see format in yolo_folder_skill.md)."
+fi
+
+# ─── Save instruction to log ─────────────────────────────────────────
+printf '%s\n' "$PROMPT" > "$TEMP_LOG_DIR/instruction.md"
+
+# ─── Run Claude and capture full output ──────────────────────────────
+# Trust model (Harness §5.1): --dangerously-skip-permissions bypasses the
+# permission system so the unattended loop has no UI prompts. The REAL safety
+# boundary is the PreToolUse hook registered in .claude/settings.json
+# (scripts/claude_bash_guard.py) which blocks rm/pip/sudo/mv/etc. regardless
+# of permission mode. Hooks fire even when permissions are skipped.
+#
+# --allowedTools MUST remain last: it is variadic and will consume any
+# following positional arguments as tool names.
+$EVENT emit claude-started --round "$ROUND" --session-id "$SESSION_ID" || true
+CLAUDE_START_TS=$SECONDS
+if printf '%s\n' "$PROMPT" | claude --dangerously-skip-permissions \
+  --print \
+  --verbose \
+  --output-format stream-json \
+  --system-prompt "$SYSTEM_PROMPT" \
+  --allowedTools "Bash,Write,Read" \
+  > "$TEMP_LOG_DIR/claude_raw.jsonl" 2>&1; then
+
+  CLAUDE_EXIT=0
+else
+  CLAUDE_EXIT=$?
+fi
+CLAUDE_DURATION=$((SECONDS - CLAUDE_START_TS))
+$EVENT emit claude-finished --round "$ROUND" --exit-code "$CLAUDE_EXIT" \
+  --duration-sec "$CLAUDE_DURATION" || true
+
+# ─── Extract readable log from stream-json ────────────────────────────
+python3 -c "
+import json, sys
+for line in open('$TEMP_LOG_DIR/claude_raw.jsonl'):
+    line = line.strip()
+    if not line: continue
+    try: msg = json.loads(line)
+    except: continue
+    t = msg.get('type', '')
+    if t == 'assistant':
+        for block in msg.get('message', {}).get('content', []):
+            if block.get('type') == 'text':
+                print('--- CLAUDE ---')
+                print(block['text'])
+                print()
+            elif block.get('type') == 'tool_use':
+                name = block.get('name', '?')
+                inp = block.get('input', {})
+                if 'command' in inp:
+                    print(f'--- TOOL: {name} ---')
+                    print(f'  \$ {inp[\"command\"]}')
+                elif 'file_path' in inp:
+                    print(f'--- TOOL: {name} ---')
+                    print(f'  file: {inp[\"file_path\"]}')
+                    if 'content' in inp:
+                        print(f'  (write {len(inp[\"content\"])} chars)')
+                    if 'old_string' in inp:
+                        print(f'  replacing {len(inp[\"old_string\"])} chars')
+                else:
+                    print(f'--- TOOL: {name} ---')
+                    print(f'  {json.dumps(inp)[:200]}')
+                print()
+    elif t == 'tool':
+        content = msg.get('content', '')
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get('text'):
+                    content = c['text']; break
+        if isinstance(content, str) and content.strip():
+            lines = content.strip().split('\n')
+            if len(lines) > 30:
+                print('\n'.join(lines[:15]))
+                print(f'  ... ({len(lines)-30} lines omitted) ...')
+                print('\n'.join(lines[-15:]))
+            else:
+                print(content.strip())
+            print()
+    elif t == 'result':
+        cost = msg.get('total_cost_usd', 0)
+        dur = msg.get('duration_ms', 0)
+        turns = msg.get('num_turns', 0)
+        print(f'--- RESULT: {msg.get(\"subtype\",\"?\")} | {turns} turns | {dur/1000:.1f}s | \${cost:.4f} ---')
+        print()
+" > "$TEMP_LOG_DIR/claude_session.log"
+EXTRACT_EXIT=$?
+if [ "$EXTRACT_EXIT" -ne 0 ]; then
+  # Fail-loud (Harness §二): silently losing the human-readable log means the
+  # operator can't debug a session. The raw JSONL is still preserved, so the
+  # session itself is recoverable — we just print a warning.
+  echo "[claude] WARN: log extractor exited $EXTRACT_EXIT — human-readable log may be incomplete." >&2
+  echo "[claude]       Raw stream-json is at $TEMP_LOG_DIR/claude_raw.jsonl" >&2
+fi
+
+# ─── Copy the next_instruction.md Claude wrote into the log folder ─────
+if [ -f "$INSTRUCTION" ]; then
+  if ! cp "$INSTRUCTION" "$TEMP_LOG_DIR/next_instruction.md"; then
+    echo "[claude] WARN: failed to snapshot next_instruction.md into log dir" >&2
+  fi
+fi
+
+# ─── Rename log folder to match the training run name ─────────────────
+sleep 3
+if [ -f "$SCRIPT_DIR/last_run_name" ]; then
+  ACTUAL_RUN_NAME=$(cat "$SCRIPT_DIR/last_run_name")
+  FINAL_LOG_DIR="$SESSION_LOG_DIR/$ACTUAL_RUN_NAME"
+  if [ ! -d "$FINAL_LOG_DIR" ]; then
+    if mv "$TEMP_LOG_DIR" "$FINAL_LOG_DIR"; then
+      echo "[claude] Logs: $FINAL_LOG_DIR/"
+    else
+      # Fail-loud (Harness §二): an unrenamed log dir means the audit trail
+      # has a "_pending" entry forever. Surface why rather than swallowing.
+      echo "[claude] WARN: mv failed — logs remain at $TEMP_LOG_DIR/" >&2
+    fi
+  else
+    echo "[claude] WARN: $FINAL_LOG_DIR already exists, keeping $TEMP_LOG_DIR/" >&2
+  fi
+else
+  echo "[claude] Logs: $TEMP_LOG_DIR/ (no last_run_name — Claude likely never launched training)"
+fi
+
+if [ $CLAUDE_EXIT -eq 0 ]; then
+  # Do NOT delete next_instruction.md — Claude wrote a NEW one for the next round
+  echo "[claude] Session complete."
+  if [ "$ROUND" -eq "$MAX_ROUNDS" ] && [ -f "$SCRIPT_DIR/training_report.md" ]; then
+    echo ""
+    echo "========================================"
+    echo "TRAINING REPORT"
+    echo "========================================"
+    cat "$SCRIPT_DIR/training_report.md"
+    echo ""
+    echo "Report saved to: $SCRIPT_DIR/training_report.md"
+  fi
+else
+  echo "[claude] ERROR: claude exited with code $CLAUDE_EXIT" >&2
+  echo "[claude] Preserving next_instruction.md for retry." >&2
+  # Circuit breaker — count Claude failures the same as train crashes. A
+  # Claude exit error usually means it never launched training (token limit,
+  # syntax error in prompt, API failure) so the loop chain dies anyway. We
+  # still record it so the operator sees a meaningful HALTED on resume.
+  FAILS=$(cat "$SCRIPT_DIR/consecutive_failures" 2>/dev/null)
+  case "$FAILS" in ''|*[!0-9]*) FAILS=0 ;; esac
+  FAILS=$((FAILS + 1))
+  echo "$FAILS" > "$SCRIPT_DIR/consecutive_failures"
+  if [ "$FAILS" -ge 3 ]; then
+    cat > "$SCRIPT_DIR/HALTED" <<HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') after $FAILS consecutive failures.
+Last failure: claude exited with code $CLAUDE_EXIT in session $SESSION_ID round $ROUND.
+
+Inspect the raw stream-json for the root cause:
+  tail -200 $TEMP_LOG_DIR/claude_raw.jsonl
+  cat $TEMP_LOG_DIR/claude_session.log
+
+To resume after fixing:
+  rm $SCRIPT_DIR/HALTED $SCRIPT_DIR/consecutive_failures
+  bash $SCRIPT_DIR/start_claude.sh
+HALT_EOF
+    echo "[claude] CIRCUIT BREAKER TRIPPED — $FAILS consecutive failures. Wrote HALTED." >&2
+    $EVENT emit halted --reason circuit-breaker-claude \
+      --details-json "{\"consecutive_failures\": $FAILS, \"last_claude_exit\": $CLAUDE_EXIT}" || true
+  fi
+  exit 1
+fi

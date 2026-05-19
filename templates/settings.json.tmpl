@@ -1,0 +1,16 @@
+{
+  "_comment": "PreToolUse Bash guard. Runs even with --dangerously-skip-permissions (hooks fire regardless of permission mode). See scripts/claude_bash_guard.py for the deny list.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 {{ROOT_DIR}}/scripts/claude_bash_guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

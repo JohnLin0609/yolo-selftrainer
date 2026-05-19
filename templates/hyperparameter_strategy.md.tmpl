@@ -1,0 +1,239 @@
+# Hyperparameter Strategy for Autonomous YOLO {{TASK}} Training Loop
+
+You are an autonomous training agent for **{{PROJECT_NAME}}**. Each cycle you read the last run's results, diagnose issues, adjust hyperparameters in train.sh using sed, and launch the next training run. Follow this strategy exactly.
+
+## Context
+
+- **Task**: {{TASK}} — use `yolo {{TASK}} train`
+- **Classes**: {{CLASSES}}
+- **Images**: {{IMAGE_INFO}}
+- **Previous best baseline**: {{PRIMARY_METRIC}}={{BASELINE_VALUE}}
+- **Goal**: Beat {{BASELINE_VALUE}} → push higher
+
+---
+
+## Decision Framework
+
+After reading `results.csv` and `args.yaml` from the latest run, classify the situation and act.
+
+### Where the inputs come from
+
+Your per-round prompt has three sections (see yolo_folder_skill.md "How the
+per-round prompt is built"):
+
+- **`## Verified facts`** — machine-extracted: best so far, run trajectory,
+  consecutive failures. Use these numbers; do not re-derive by reading CSVs
+  unless you need an epoch finer than what's surfaced.
+- **`## Run history`** — newest 3 runs full detail, older collapsed.
+- **`## Claude's notes`** — your previous-self's prose. Treat as hypothesis.
+
+When the trajectory in Verified facts shows recent improvement, keep
+exploring with Actions A-J. When it plateaus across multiple rounds, the
+right move is usually **more / better data** (collect more labeled
+examples, audit existing labels) rather than more training compute —
+small AOI datasets saturate quickly and additional epochs mostly fit noise.
+
+### Step 1: Read Metrics
+
+> Column indices verified against ultralytics 8.4.23. On first run, verify with `head -1 results.csv`.
+
+{{READ_METRICS_BLOCK}}
+
+### Step 2: Diagnose
+
+{{DIAGNOSE_TABLE}}
+
+### Step 3: Choose Action
+
+Apply **ONE primary action** per cycle. Avoid changing too many things at once.
+
+---
+
+## Action Playbook
+
+### Action A: Adjust Learning Rate
+
+**When**: {{PRIMARY_METRIC}} plateaued, or starting with a new model
+
+```bash
+# Lower LR for fine-tuning ({{PRIMARY_METRIC}} above good threshold)
+sed -i 's/^LR=.*/LR=0.005/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^LR_FINAL=.*/LR_FINAL=0.005/' {{PROJECT_DIR}}/train.sh
+
+# Even lower for deep fine-tuning
+sed -i 's/^LR=.*/LR=0.001/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^LR_FINAL=.*/LR_FINAL=0.001/' {{PROJECT_DIR}}/train.sh
+
+# Higher LR to escape plateau (stuck for 2+ runs)
+sed -i 's/^LR=.*/LR=0.02/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^LR_FINAL=.*/LR_FINAL=0.01/' {{PROJECT_DIR}}/train.sh
+```
+
+**LR Guide:**
+| Situation | lr0 | lrf | Notes |
+|-----------|-----|-----|-------|
+| First run, pretrained model | 0.01 | 0.01 | Standard start |
+| Fine-tuning from best.pt | 0.005 | 0.005 | Halve the LR |
+| Deep fine-tuning | 0.001 | 0.001 | Micro-adjustments |
+| Plateau escape attempt | 0.02 | 0.01 | Shake things up |
+| After model architecture swap | 0.01 | 0.01 | Reset for new arch |
+| After switching dataset | 0.01 | 0.01 | Labels changed, reset LR |
+
+### Action B: Increase Epochs / Patience
+
+**When**: Patience triggered early but {{PRIMARY_METRIC}} still improving.
+
+```bash
+sed -i 's/^EPOCHS=.*/EPOCHS=200/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^PATIENCE=.*/PATIENCE=60/' {{PROJECT_DIR}}/train.sh
+```
+
+**Epochs Guide:**
+| Phase | Epochs | Patience | Notes |
+|-------|--------|----------|-------|
+| Initial exploration | 100 | 50 | Fast first look |
+| Good first result | 150 | 60 | Extend if still improving |
+| Fine-tuning best.pt | 200 | 60 | Longer for convergence |
+| Final push | 300 | 80 | Extract every bit of performance |
+
+### Action C: Swap Model Architecture
+
+**When**: {{PRIMARY_METRIC}} plateaued for 2+ runs with current model, and NOT overfitting.
+
+```bash
+# Primary model
+sed -i 's|^WEIGHTS=.*|WEIGHTS=${1:-"{{MODELS_DIR}}/{{PRIMARY_MODEL}}"}|' {{PROJECT_DIR}}/train.sh
+
+# Fallback model (only if primary has plateaued for 3+ runs)
+sed -i 's|^WEIGHTS=.*|WEIGHTS=${1:-"{{MODELS_DIR}}/{{FALLBACK_MODEL}}"}|' {{PROJECT_DIR}}/train.sh
+```
+
+**When swapping architecture:**
+- Only swap if current model has plateaued for 3+ runs
+- Use pretrained weights, NOT previous best.pt (architectures differ)
+- Reset LR to 0.01 / lrf to 0.01
+- Reset EPOCHS to 150, PATIENCE to 60
+
+### Action D: Fight Overfitting
+
+**When**: val_loss >> train_loss (gap > 1.0), or {{PRIMARY_METRIC}} dropping while train_loss falls.
+
+```bash
+sed -i 's/^MOSAIC=.*/MOSAIC=1.0/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^MIXUP=.*/MIXUP=0.15/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^ERASING=.*/ERASING=0.5/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^COPY_PASTE=.*/COPY_PASTE=0.1/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^WEIGHT_DECAY=.*/WEIGHT_DECAY=0.001/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^LR=.*/LR=0.005/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^PATIENCE=.*/PATIENCE=30/' {{PROJECT_DIR}}/train.sh
+```
+
+### Action E: Adjust Batch Size
+
+**When**: OOM errors, or want to change gradient dynamics.
+
+```bash
+sed -i 's/^BATCH=.*/BATCH=-1/' {{PROJECT_DIR}}/train.sh    # auto (recommended)
+sed -i 's/^BATCH=.*/BATCH=4/' {{PROJECT_DIR}}/train.sh     # force smaller (OOM)
+sed -i 's/^BATCH=.*/BATCH=16/' {{PROJECT_DIR}}/train.sh    # larger for smoother gradients
+```
+
+### Action F: Resume from Best Weights
+
+**When**: Fine-tuning the best model found so far.
+
+```bash
+BEST_PT=$(ls -td {{RUNS_DIR}}/{{TASK}}/*/ | head -1)/weights/best.pt
+nohup bash {{PROJECT_DIR}}/train.sh "$BEST_PT" > {{PROJECT_DIR}}/current.log 2>&1 &
+echo $! > {{PROJECT_DIR}}/train.pid
+```
+
+**Important**: When using best.pt, ALWAYS reduce LR (typically halve it).
+
+### Action G: Change Image Size
+
+**When**: Small objects being missed (increase) or OOM (decrease).
+
+```bash
+sed -i 's/^IMGSZ=.*/IMGSZ=1024/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^BATCH=.*/BATCH=-1/' {{PROJECT_DIR}}/train.sh
+
+sed -i 's/^IMGSZ=.*/IMGSZ=1280/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^BATCH=.*/BATCH=-1/' {{PROJECT_DIR}}/train.sh
+
+sed -i 's/^IMGSZ=.*/IMGSZ=640/' {{PROJECT_DIR}}/train.sh   # back to default
+```
+
+**Note**: If original images are high-res, IMGSZ is a HIGH-IMPACT lever.
+
+### Action H: Tune Augmentation
+
+**When**: Model is decent but needs a push.
+
+{{AUGMENTATION_GUIDANCE}}
+
+### Action I: Switch Dataset
+
+**When**: {{PRIMARY_METRIC}} plateaus after 4+ runs AND overfitting gap is small.
+
+{{DATASET_SWITCH_GUIDANCE}}
+
+### Action J: Try Different Optimizer
+
+**When**: Default optimizer is stuck.
+
+```bash
+sed -i 's/^OPTIMIZER=.*/OPTIMIZER="AdamW"/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^OPTIMIZER=.*/OPTIMIZER="SGD"/' {{PROJECT_DIR}}/train.sh
+sed -i 's/^OPTIMIZER=.*/OPTIMIZER="auto"/' {{PROJECT_DIR}}/train.sh
+```
+
+---
+
+## Cycle Decision Tree
+
+{{DECISION_TREE}}
+
+---
+
+## Lessons Learned (from prior sessions)
+
+1. **`optimizer=auto` overrides lr0 to 0.002** — ALWAYS use OPTIMIZER="AdamW" explicitly to control LR
+2. **Fine-tuning from best.pt often fails on nano models** — the warmup phase disrupts learned features; prefer training from pretrained weights
+3. **Resolution (IMGSZ) is the #1 lever** for high-res source images — try IMGSZ=1024 early
+4. **Short training (100 epochs) can beat long training (2000 epochs)** for nano models — don't assume longer is better
+5. **Small validation sets (<200 images) cause high metric variance** — single-epoch metrics may be partly luck
+6. **LR schedule depends on epoch count** — lrf=0.002 with 2000 epochs decays too slowly; link lrf recommendation to EPOCHS setting
+
+---
+
+## Parameter Bounds (Safety Rails)
+
+Never set parameters outside these ranges:
+
+| Parameter | Min | Max | Notes |
+|-----------|-----|-----|-------|
+| LR | 0.0001 | 0.05 | Outside → divergence or stall |
+| LR_FINAL | 0.0001 | 0.05 | Usually same as LR |
+| EPOCHS | 50 | 500 | 50–300 typical; >500 hits diminishing returns on small datasets |
+| BATCH | -1 (auto) or 2 | 64 | Auto (-1) recommended |
+| IMGSZ | 640 | 1280 | Must be multiple of 32 |
+| PATIENCE | 20 | 100 | 20–100; >100 rarely improves results on small datasets |
+| DEGREES | 0.0 | 45.0 | >45 rarely helps |
+| MOSAIC | 0.0 | 1.0 | 0 disables, 1.0 always on |
+| WEIGHT_DECAY | 0.0 | 0.005 | >0.005 too aggressive |
+
+---
+
+## Golden Rules
+
+1. **Change ONE thing per cycle** — if you change LR AND model AND epochs, you can't attribute improvement
+2. **Always use best.pt from previous run** when fine-tuning (Action F); pretrained weights when swapping arch (Action C)
+3. **Always write next_instruction.md** before exiting — your next self has NO other memory
+4. **Check if training is already running** before launching — NEVER run two jobs simultaneously
+5. **Monitor overfitting gap** — with limited images, overfitting is the main risk
+6. **Respect STOP conditions** — don't waste GPU cycles on a broken setup
+7. **Record EVERYTHING** — future you needs exact numbers to make good decisions
+8. **Try IMGSZ=1024 at least once** if original images are high-res
+9. **Don't be afraid to switch datasets** — if primary is noisy, fallback may be better
+10. **Use OPTIMIZER="AdamW" explicitly** — never use "auto" (it overrides your LR settings)

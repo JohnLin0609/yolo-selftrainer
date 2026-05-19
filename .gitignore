@@ -1,12 +1,27 @@
-# Runtime state
+# Self-contained environment
+.venv/
+
+# Pretrained model weights (large binaries)
+models/
+
+# Training run outputs
+runs/
+
+# Dataset symlinks/copies
+datasets/
+
+# Per-project content — projects are user-specific, never check them in.
+# .gitkeep is the lone exception so the empty directory survives a clone.
+projects/*
+!projects/.gitkeep
+
+# Legacy root-level state (from old hardcoded project)
 next_instruction.md
 round_counter
 session_id
 last_run_name
 train.pid
 current.log
-
-# Logs (large JSONL files)
 logs/
 
 # Claude config

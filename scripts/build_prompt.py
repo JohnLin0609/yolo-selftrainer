@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""Build the per-round Claude prompt from machine facts + Claude's prose.
+
+Why this exists (Harness §六 + §八 + §10):
+  Before P3, next_instruction.md (written by Claude) was the ONLY memory
+  between rounds. Three problems:
+    1. Claude's prose was the source of truth — a mis-recall propagated.
+    2. The file grew unbounded; rounds 20+ would pay for the bloat of every
+       earlier run sitting in the prompt.
+    3. Same file served the human reading the log AND the next Claude. The
+       two views need different filters (UI vs Model — §8).
+
+  This script splits the prompt into three layers:
+    (1) Machine facts pulled directly from events.jsonl + results.csv. Claude
+        sees the same numbers a human would compute. No prose middleman.
+    (2) Run history with the newest N runs in full and older runs collapsed
+        to one line each (Harness §6.4.1 micro-compact — recent full text,
+        old stuff cleared to a marker but never deleted).
+    (3) Claude's free-form notes from the previous round. Labeled clearly as
+        "may contain errors" so when prose disagrees with facts, Claude knows
+        which to trust.
+
+Why we don't always include all three:
+  Cold start has no events yet. We delegate that case back to the bash
+  cold-start prompt in start_claude.sh — building Claude's first-round
+  instructions belongs in the orchestrator, not here.
+
+Token budget:
+  No fancy estimator. We just cap the prose section at MAX_PROSE_CHARS and
+  strip auto-generated sections (the human reads them in the per-round log
+  dir anyway). Tuned for Sonnet/Opus 200K windows; override via env var
+  YOLO_TRAINER_PROSE_BUDGET if you run on a smaller model.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+
+RECENT_RUNS_FULL = 3  # most recent N runs get full detail in the history section
+MAX_PROSE_CHARS = int(os.environ.get("YOLO_TRAINER_PROSE_BUDGET", "12000"))
+
+
+# Section headings in Claude-written next_instruction.md that we drop during
+# micro-compaction. The machine-facts section above already contains this
+# information verbatim, so keeping Claude's prose copy just wastes tokens.
+PROSE_SECTIONS_TO_DROP = (
+    "Run history & analysis",
+    "Improvement trajectory",
+)
+
+
+def load_events(project: Path) -> list[dict]:
+    p = project / "events.jsonl"
+    if not p.exists():
+        return []
+    out: list[dict] = []
+    with p.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                # The event log reader (event.py read_all) warns loudly; here
+                # we just skip — the prompt build should still succeed.
+                continue
+    return out
+
+
+def runs_in_order(events: list[dict]) -> list[dict]:
+    return sorted(
+        (e for e in events if e.get("type") == "training_metrics"),
+        key=lambda e: e.get("ts", ""),
+    )
+
+
+def fmt_metric(value, digits: int = 4) -> str:
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def build_facts_section(events: list[dict]) -> str:
+    runs = runs_in_order(events)
+    last_round = max(
+        (e["round"] for e in events if isinstance(e.get("round"), int)),
+        default=0,
+    )
+
+    # Consecutive failures since the most recent successful training.
+    consec_fail = 0
+    for e in reversed(events):
+        t = e.get("type")
+        if t == "training_finished":
+            if e.get("exit_code") == 0:
+                break
+            consec_fail += 1
+        elif t in ("validation_failed", "preflight_failed"):
+            consec_fail += 1
+
+    # Best run by best_metric_value (higher = better for all primary metrics).
+    best = max(
+        runs,
+        key=lambda r: float(r.get("best_metric_value", -1.0) or -1.0),
+        default=None,
+    )
+
+    # Recent trajectory — easier than asking Claude to scan the history table.
+    trajectory = [r.get("best_metric_value") for r in runs[-10:]]
+
+    lines = ["## Verified facts (machine-extracted from events.jsonl)"]
+    lines.append("> These are not Claude's recollection. Trust these over any disagreement")
+    lines.append("> with the free-form notes below.")
+    lines.append("")
+    lines.append(f"- Last round in log: {last_round}")
+    lines.append(f"- Total successful training runs: {len(runs)}")
+    lines.append(f"- Consecutive failures since last success: {consec_fail}")
+    if best is not None:
+        lines.append(
+            f"- BEST so far: {best['best_metric_name']}={fmt_metric(best['best_metric_value'])} "
+            f"at run `{best['run_name']}` epoch {best['best_epoch']} (round {best.get('round','?')})"
+        )
+    if trajectory:
+        traj_str = ", ".join(fmt_metric(v, 3) for v in trajectory)
+        lines.append(f"- Last {len(trajectory)} runs trajectory: [{traj_str}]")
+    return "\n".join(lines)
+
+
+def build_metrics_table_section(events: list[dict]) -> str:
+    """Per-round table of ALL evaluation metrics at the best epoch.
+
+    Sourced from training_metrics events' `extras` dict (populated by
+    event.py extract_metrics_from_run). The Δ column tracks change in the
+    primary metric vs the previous run — easy at-a-glance trajectory read.
+    """
+    runs = runs_in_order(events)
+    if not runs:
+        return ""
+
+    # Stable union of extras keys across all runs
+    seen_keys: list[str] = []
+    for r in runs:
+        for k in (r.get("extras") or {}):
+            if k not in seen_keys:
+                seen_keys.append(k)
+
+    label_map = {
+        "metrics/precision(B)": "P",
+        "metrics/recall(B)":    "R",
+        "metrics/mAP50(B)":     "mAP50",
+        "metrics/mAP50-95(B)":  "mAP50-95",
+        "train/box_loss":       "tr_box",
+        "train/cls_loss":       "tr_cls",
+        "train/dfl_loss":       "tr_dfl",
+        "val/box_loss":         "val_box",
+        "val/cls_loss":         "val_cls",
+        "val/dfl_loss":         "val_dfl",
+        "overfit_gap_box":      "gap",
+    }
+    labels = [label_map.get(k, k) for k in seen_keys]
+
+    headers = ["#", "ep", "Δ"] + labels
+    lines = [
+        "## Per-round metrics at best epoch",
+        "> Every value below is at the epoch where the primary metric peaked,",
+        "> extracted from the run's results.csv (NOT Claude's recollection).",
+        "> Δ = change vs previous run. gap = val_box_loss − train_box_loss",
+        "> (positive = overfitting; near 0 = healthy).",
+        "",
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join("---" for _ in headers) + "|",
+    ]
+
+    prev_primary = None
+    for r in runs:
+        ep = r.get("best_epoch", "?")
+        primary = r.get("best_metric_value", 0.0) or 0.0
+        delta = "—" if prev_primary is None else f"{primary - prev_primary:+.4f}"
+        prev_primary = primary
+        cells = [str(r.get("round", "?")), str(ep), delta]
+        extras = r.get("extras") or {}
+        for k in seen_keys:
+            v = extras.get(k)
+            cells.append(f"{v:.4f}" if isinstance(v, (int, float)) else "")
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def build_history_section(events: list[dict]) -> str:
+    runs = runs_in_order(events)
+    if not runs:
+        return "## Run history\n(no completed runs in events.jsonl yet)"
+
+    n = len(runs)
+    full_idx = max(0, n - RECENT_RUNS_FULL)
+
+    lines = [
+        "## Run history",
+        f"> Oldest {full_idx} runs are micro-compacted to one line each (Harness §6.4.1).",
+        f"> The last {n - full_idx} runs have full detail. Read the run dir's results.csv",
+        f"> if you need finer-grained metrics than what's shown here.",
+        "",
+    ]
+
+    for i, r in enumerate(runs):
+        run_no = i + 1
+        run_name = r.get("run_name", "?")
+        metric_name = r.get("best_metric_name", "?")
+        metric_val = r.get("best_metric_value", -1.0)
+        best_ep = r.get("best_epoch", "?")
+        final_ep = r.get("final_epoch", "?")
+        total_ep = r.get("total_epochs", "?")
+        patience = " (patience triggered)" if r.get("patience_triggered") else ""
+
+        if i < full_idx:
+            lines.append(
+                f"- Run #{run_no}: {metric_name}={fmt_metric(metric_val)} "
+                f"@ep{best_ep}/{final_ep}  `{run_name}`"
+            )
+        else:
+            lines.append(f"")
+            lines.append(f"### Run #{run_no} — `{run_name}` (round {r.get('round','?')})")
+            lines.append(
+                f"  {metric_name}: {fmt_metric(metric_val)} at epoch {best_ep}"
+            )
+            lines.append(
+                f"  Trained {final_ep}/{total_ep} epochs{patience}"
+            )
+
+    return "\n".join(lines)
+
+
+def compact_prose(text: str) -> str:
+    """Drop auto-generated sections that duplicate machine facts.
+
+    The structure of next_instruction.md is loose markdown — sections start
+    with `## <title>` and continue until the next `## ` or EOF. We strip
+    sections whose title matches PROSE_SECTIONS_TO_DROP, then truncate if
+    still over budget.
+    """
+    if not text:
+        return text
+
+    # Split on level-2 headings, preserving the heading text per segment.
+    parts = re.split(r"(?m)^(?=##\s)", text)
+    out_parts: list[str] = []
+    for part in parts:
+        first_line = part.lstrip("\n").split("\n", 1)[0]
+        match = re.match(r"##\s+(.+?)\s*$", first_line)
+        if match:
+            title = match.group(1).strip()
+            if any(drop in title for drop in PROSE_SECTIONS_TO_DROP):
+                continue
+        out_parts.append(part)
+    compacted = "".join(out_parts)
+
+    if len(compacted) > MAX_PROSE_CHARS:
+        head = compacted[: MAX_PROSE_CHARS // 2]
+        tail = compacted[-MAX_PROSE_CHARS // 2 :]
+        compacted = (
+            head
+            + f"\n\n[... prose truncated: {len(compacted) - MAX_PROSE_CHARS} chars omitted from middle ...]\n\n"
+            + tail
+        )
+    return compacted
+
+
+def build_prose_section(project: Path) -> str | None:
+    p = project / "next_instruction.md"
+    if not p.exists():
+        return None
+    raw = p.read_text()
+    return compact_prose(raw)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("project", type=Path)
+    ap.add_argument("--round", type=int, required=True)
+    ap.add_argument("--max-rounds", type=int, required=True)
+    args = ap.parse_args()
+
+    events = load_events(args.project)
+    has_runs = any(e.get("type") == "training_metrics" for e in events)
+
+    sections: list[str] = [f"# Round {args.round} of {args.max_rounds}"]
+
+    if has_runs:
+        sections.append(build_facts_section(events))
+        sections.append(build_metrics_table_section(events))
+        sections.append(build_history_section(events))
+    else:
+        sections.append(
+            "## Status\nNo completed training runs in events.jsonl yet. "
+            "Either this is a fresh project or the prior run failed before "
+            "emitting training_metrics."
+        )
+
+    prose = build_prose_section(args.project)
+    if prose:
+        sections.append(
+            "## Claude's notes from previous round (FREE-FORM — may contain errors)"
+        )
+        sections.append(
+            "> Cross-check any number you reuse against the verified facts above."
+        )
+        sections.append(prose)
+
+    # Per-round directives. The hardcoded "Round N-1 = mandatory Action K"
+    # was intentionally removed in P5; convergence signal will drive that.
+    if args.round >= args.max_rounds:
+        sections.append(
+            "## THIS IS THE FINAL ROUND\n"
+            "Do NOT launch training. Instead:\n"
+            "1. Verify the latest run's results from events.jsonl + the run dir's results.csv\n"
+            "2. Write a comprehensive next_instruction.md summarizing all runs, best result,\n"
+            "   best model path, and recommendations for the next session\n"
+            "3. Exit"
+        )
+
+    print("\n\n".join(sections))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

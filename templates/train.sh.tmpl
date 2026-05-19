@@ -1,0 +1,302 @@
+#!/bin/bash
+# Do NOT use set -e — we need to catch training failures and still wake Claude
+
+# Activate venv (has ultralytics + torch installed)
+source {{VENV_PATH}}/bin/activate
+
+# Verify ultralytics version
+python -c "import ultralytics; v=ultralytics.__version__; assert v.startswith('8.'), f'Expected ultralytics 8.x, got {v}'"
+
+DATASET="{{DATASET_YAML}}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FRAMEWORK_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+EVENT="python3 $FRAMEWORK_ROOT/scripts/event.py $SCRIPT_DIR"
+
+# Read round counter (cached view of events.jsonl — see scripts/event.py).
+# Defaults to 0 if cache is missing; events.jsonl is the source of truth.
+ROUND=$(cat "$SCRIPT_DIR/round_counter" 2>/dev/null || echo 0)
+case "$ROUND" in ''|*[!0-9]*) ROUND=0 ;; esac
+
+# Parameters — edit these each cycle using sed
+WEIGHTS=${1:-"{{MODELS_DIR}}/{{PRIMARY_MODEL}}"}
+EPOCHS=100
+LR=0.01
+LR_FINAL=0.01
+BATCH=-1
+IMGSZ={{IMGSZ}}
+PATIENCE=50
+# AdamW explicit — optimizer=auto overrides lr0 in ultralytics 8.4.x
+OPTIMIZER="AdamW"
+MOMENTUM=0.937
+WEIGHT_DECAY=0.0005
+WARMUP_EPOCHS=3.0
+WARMUP_MOMENTUM=0.8
+COS_LR=false
+HSV_H=0.015
+HSV_S=0.7
+HSV_V=0.4
+DEGREES={{DEGREES}}
+TRANSLATE=0.1
+SCALE={{SCALE}}
+FLIPLR={{FLIPLR}}
+FLIPUD={{FLIPUD}}
+MOSAIC={{MOSAIC}}
+MIXUP={{MIXUP}}
+COPY_PASTE={{COPY_PASTE}}
+ERASING={{ERASING}}
+CLOSE_MOSAIC=10
+
+# ─── Parameter validation (Harness §5.1 trust boundary) ──────────────
+# Claude edits these with sed. A bad edit could waste 12 hours on a divergent
+# run. Validate against the bounds in hyperparameter_strategy.md BEFORE
+# launching training. On failure we abort, wake Claude, and do NOT consume a
+# round (no train_completed touched).
+echo "[validator] checking train.sh parameters against hyperparameter_strategy.md bounds"
+export LR LR_FINAL EPOCHS PATIENCE IMGSZ BATCH DEGREES MOSAIC MIXUP \
+       COPY_PASTE ERASING FLIPLR FLIPUD SCALE WEIGHT_DECAY OPTIMIZER
+python3 - <<'VALIDATE_PARAMS'
+import os, sys
+ok = True
+def fail(msg):
+    global ok
+    ok = False
+    print(f'  ✗ {msg}', file=sys.stderr)
+def rng(name, lo, hi, allow=()):
+    raw = os.environ.get(name, '')
+    if raw in allow:
+        return
+    try:
+        v = float(raw)
+    except ValueError:
+        fail(f"{name}={raw!r} is not a number"); return
+    if v < lo or v > hi:
+        fail(f"{name}={v} outside bounds [{lo}, {hi}]")
+rng('LR',           0.0001, 0.05)
+rng('LR_FINAL',     0.0001, 0.05)
+rng('EPOCHS',       50,     500)
+rng('PATIENCE',     20,     100)
+rng('IMGSZ',        640,    1280)
+rng('BATCH',        2,      64,    allow=('-1',))
+rng('DEGREES',      0.0,    45.0)
+rng('MOSAIC',       0.0,    1.0)
+rng('MIXUP',        0.0,    1.0)
+rng('COPY_PASTE',   0.0,    1.0)
+rng('ERASING',      0.0,    1.0)
+rng('FLIPLR',       0.0,    1.0)
+rng('FLIPUD',       0.0,    1.0)
+rng('SCALE',        0.0,    1.0)
+rng('WEIGHT_DECAY', 0.0,    0.005)
+try:
+    imgsz = int(float(os.environ['IMGSZ']))
+    if imgsz % 32 != 0:
+        fail(f"IMGSZ={imgsz} not a multiple of 32 (YOLO requirement)")
+except (ValueError, KeyError):
+    pass
+opt = os.environ.get('OPTIMIZER', '')
+if opt not in ('AdamW', 'SGD', 'auto'):
+    fail(f"OPTIMIZER={opt!r} not in {{'AdamW','SGD','auto'}}")
+sys.exit(0 if ok else 1)
+VALIDATE_PARAMS
+VALIDATE_EXIT=$?
+
+if [ "$VALIDATE_EXIT" -ne 0 ]; then
+  echo "[train] ABORT: parameter validation failed. Refusing to launch training." >&2
+  $EVENT emit validation-failed --round "$ROUND" --violations-json '{"see_log":"current.log"}' || true
+  cat > "$SCRIPT_DIR/next_instruction.md" <<VALIDATE_ABORT_EOF
+## Training ABORTED — parameters out of bounds
+
+train.sh refused to launch because one or more parameters violate the safety
+bounds in hyperparameter_strategy.md. Full validator output is in current.log.
+
+## Diagnose
+1. Show current params:
+   grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER|DEGREES|MOSAIC|MIXUP|COPY_PASTE|ERASING|FLIPLR|FLIPUD|SCALE|WEIGHT_DECAY)=' $SCRIPT_DIR/train.sh
+2. Re-read the "Parameter Bounds" table in hyperparameter_strategy.md
+3. Adjust the violating param back into range with sed
+4. Re-launch training with: nohup bash $SCRIPT_DIR/train.sh > $SCRIPT_DIR/current.log 2>&1 &
+
+This round did NOT consume a slot — fix and retry.
+VALIDATE_ABORT_EOF
+  # Failure counter: count validation failures the same as train crashes
+  FAILS=$(cat "$SCRIPT_DIR/consecutive_failures" 2>/dev/null || echo 0)
+  FAILS=$((FAILS + 1))
+  echo "$FAILS" > "$SCRIPT_DIR/consecutive_failures"
+  if [ "$FAILS" -ge 3 ]; then
+    cat > "$SCRIPT_DIR/HALTED" <<HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') after $FAILS consecutive failures.
+Last failure: parameter validation ($RUN_NAME never started).
+
+To resume: fix train.sh params, then:
+  rm $SCRIPT_DIR/HALTED $SCRIPT_DIR/consecutive_failures
+  bash $SCRIPT_DIR/start_claude.sh
+HALT_EOF
+    echo "[train] CIRCUIT BREAKER TRIPPED — $FAILS consecutive failures. Wrote HALTED." >&2
+    $EVENT emit halted --reason circuit-breaker-validation \
+      --details-json "{\"consecutive_failures\": $FAILS}" || true
+    exit 1
+  fi
+  echo "[train] Waking the agent to fix params (failure $FAILS/3)..." >&2
+  if [ -f "$SCRIPT_DIR/start_agent.sh" ]; then
+    bash "$SCRIPT_DIR/start_agent.sh"
+  else
+    bash "$SCRIPT_DIR/start_claude.sh"
+  fi
+  exit 1
+fi
+
+# ─── Generate run name: YYYYMMDD_HHMMSS_claude_MODEL ────────────────
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+# Extract model short name from weights path (e.g., yolo11n-obb.pt → v11, yolov8n-obb.pt → v8)
+if echo "$WEIGHTS" | grep -q "best.pt"; then
+  # Fine-tuning from a previous run's best.pt — try to extract model from parent dir name
+  PARENT_DIR=$(basename "$(dirname "$(dirname "$WEIGHTS")")")
+  MODEL_SHORT=$(echo "$PARENT_DIR" | grep -oE 'v[0-9]+' | head -1)
+  MODEL_SHORT="${MODEL_SHORT:-ft}_ft"
+else
+  MODEL_SHORT=$(basename "$WEIGHTS" | sed -E 's/.*yolo[v]?([0-9]+).*/v\1/')
+fi
+RUN_NAME="${TIMESTAMP}_claude_${MODEL_SHORT}"
+
+# Write run name immediately so start_claude.sh can find it for logging
+echo "$RUN_NAME" > "$SCRIPT_DIR/last_run_name"
+
+echo "[train] Run: $RUN_NAME | weights: $WEIGHTS | lr: $LR | epochs: $EPOCHS"
+
+# Event: training started (audit trail — events.jsonl is Harness §九 source of truth).
+# `|| true` because emit failure must NOT abort the training run itself.
+$EVENT emit training-started --round "$ROUND" --run-name "$RUN_NAME" \
+  --params-json "$(python3 -c "
+import json
+print(json.dumps({
+  'weights': '$WEIGHTS', 'epochs': $EPOCHS, 'lr': $LR, 'lr_final': $LR_FINAL,
+  'batch': '$BATCH', 'imgsz': $IMGSZ, 'patience': $PATIENCE,
+  'optimizer': '$OPTIMIZER', 'mosaic': $MOSAIC, 'mixup': $MIXUP,
+  'degrees': $DEGREES, 'erasing': $ERASING, 'weight_decay': $WEIGHT_DECAY,
+}))
+")" || true
+
+TRAIN_START_TS=$SECONDS
+
+yolo {{TASK}} train \
+  data="$DATASET" \
+  model="$WEIGHTS" \
+  epochs="$EPOCHS" \
+  lr0="$LR" \
+  lrf="$LR_FINAL" \
+  batch="$BATCH" \
+  imgsz="$IMGSZ" \
+  patience="$PATIENCE" \
+  optimizer="$OPTIMIZER" \
+  momentum="$MOMENTUM" \
+  weight_decay="$WEIGHT_DECAY" \
+  warmup_epochs="$WARMUP_EPOCHS" \
+  warmup_momentum="$WARMUP_MOMENTUM" \
+  cos_lr="$COS_LR" \
+  hsv_h="$HSV_H" \
+  hsv_s="$HSV_S" \
+  hsv_v="$HSV_V" \
+  degrees="$DEGREES" \
+  translate="$TRANSLATE" \
+  scale="$SCALE" \
+  fliplr="$FLIPLR" \
+  flipud="$FLIPUD" \
+  mosaic="$MOSAIC" \
+  mixup="$MIXUP" \
+  copy_paste="$COPY_PASTE" \
+  erasing="$ERASING" \
+  close_mosaic="$CLOSE_MOSAIC" \
+  project="{{RUNS_DIR}}/{{TASK}}" \
+  name="$RUN_NAME" \
+  exist_ok=false \
+  amp=true \
+  device={{DEVICE}} \
+  workers=8
+
+TRAIN_EXIT=$?
+TRAIN_DURATION=$((SECONDS - TRAIN_START_TS))
+
+# Event: training finished. Emit before any decision logic so a crash in the
+# circuit-breaker code below doesn't lose the audit record.
+$EVENT emit training-finished --round "$ROUND" --run-name "$RUN_NAME" \
+  --exit-code "$TRAIN_EXIT" --duration-sec "$TRAIN_DURATION" || true
+
+# ─── Circuit breaker (Harness §6.4.5) ────────────────────────────────
+# Reset the counter on success so a clean run wipes prior failures.
+# On crash, bump the counter; if we hit 3 consecutive failures we write HALTED
+# and refuse to wake Claude. start_claude.sh checks HALTED at the top so the
+# loop dies cleanly instead of burning GPU on a broken setup.
+if [ $TRAIN_EXIT -eq 0 ]; then
+  echo "[train] Done: $RUN_NAME"
+  echo "0" > "$SCRIPT_DIR/consecutive_failures"
+  # Read results.csv and emit a training_metrics event for P3/P5 consumers.
+  $EVENT extract-metrics --run-dir "{{RUNS_DIR}}/{{TASK}}/$RUN_NAME" \
+    --task "{{TASK}}" --round "$ROUND" --run-name "$RUN_NAME" || true
+else
+  echo "[train] FAILED (exit code $TRAIN_EXIT) — diagnosing..." >&2
+  PARAMS=$(grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER|DATASET)=' "$SCRIPT_DIR/train.sh")
+  if [ -z "$PARAMS" ]; then
+    echo "[train] WARN: could not read params from train.sh" >&2
+    PARAMS="(grep returned no matches; train.sh may be corrupted)"
+  fi
+  cat > "$SCRIPT_DIR/next_instruction.md" <<CRASH_EOF
+## Training CRASHED
+
+Run $RUN_NAME failed with exit code $TRAIN_EXIT.
+
+## Diagnose
+1. Check the log: tail -50 $SCRIPT_DIR/current.log
+2. Look for: OOM, NaN, CUDA error, dataset error, missing file
+3. Check if a partial run exists: ls -la {{RUNS_DIR}}/{{TASK}}/$RUN_NAME/
+4. If OOM: reduce BATCH or IMGSZ in train.sh with sed
+5. If other error: fix and relaunch
+6. If unfixable: write STOP in next_instruction.md
+
+## Previous params
+$PARAMS
+
+Rewrite next_instruction.md with full history before exiting.
+CRASH_EOF
+  FAILS=$(cat "$SCRIPT_DIR/consecutive_failures" 2>/dev/null)
+  case "$FAILS" in ''|*[!0-9]*) FAILS=0 ;; esac
+  FAILS=$((FAILS + 1))
+  echo "$FAILS" > "$SCRIPT_DIR/consecutive_failures"
+  if [ "$FAILS" -ge 3 ]; then
+    cat > "$SCRIPT_DIR/HALTED" <<HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') after $FAILS consecutive training failures.
+
+Last failure: $RUN_NAME exited with code $TRAIN_EXIT.
+
+Diagnose the root cause (do NOT just retry):
+  tail -100 $SCRIPT_DIR/current.log
+  cat $SCRIPT_DIR/next_instruction.md
+
+To resume after fixing:
+  rm $SCRIPT_DIR/HALTED $SCRIPT_DIR/consecutive_failures
+  bash $SCRIPT_DIR/start_claude.sh
+HALT_EOF
+    echo "[train] CIRCUIT BREAKER TRIPPED — $FAILS consecutive failures. Wrote HALTED." >&2
+    echo "[train] Not waking Claude. Inspect $SCRIPT_DIR/HALTED to resume." >&2
+    $EVENT emit halted --reason circuit-breaker-train \
+      --details-json "{\"consecutive_failures\": $FAILS, \"last_exit_code\": $TRAIN_EXIT}" || true
+    touch "$SCRIPT_DIR/train_completed"  # consume the round so resume starts clean
+    exit 1
+  fi
+  echo "[train] Failure $FAILS/3 — waking Claude to diagnose..." >&2
+fi
+
+# Clear train.pid before the recursive call. The current bash (train.sh) is
+# the PID written here, and start_claude.sh will momentarily call Claude
+# which checks "is training running?" by `kill -0 $(cat train.pid)`. Without
+# clearing, that check returns "still alive" (our own wrapper bash) and
+# round N+1 Claude exits without launching anything — chain breaks (P8 bug).
+rm -f "$SCRIPT_DIR/train.pid"  # before recursive start_*.sh call
+echo "[train] Waking the agent loop..."
+touch "$SCRIPT_DIR/train_completed"
+# Auto-detect mode: agent mode scaffolds start_agent.sh; classic CLI mode
+# only has start_claude.sh. Either way, the round-counter / events / circuit
+# breaker are shared so the loop semantics are identical.
+if [ -f "$SCRIPT_DIR/start_agent.sh" ]; then
+  bash "$SCRIPT_DIR/start_agent.sh"
+else
+  bash "$SCRIPT_DIR/start_claude.sh"
+fi
