@@ -213,6 +213,70 @@ completed rounds are intact.
 
 ---
 
+## Measuring agent uplift with `--mode baseline`
+
+The agent (claude or litellm) decides hyperparameters each round. But is its
+reasoning actually beating a dumb random sampler over the same parameter
+space? Without a control, an mAP of 0.99 could be a real win, or just what
+any policy inside the validator bounds would have produced.
+
+`--mode baseline` runs the entire pipeline (preflight → train.sh → validator
+→ events → circuit breaker → report) **identically**, except the per-round
+hyperparameter choice comes from `scripts/baseline_policy.py` — a seeded
+random search inside the validator bounds, with round 1 fixed to the
+scaffolded defaults (the "no-tuning floor"). No LLM is called.
+
+### How to run
+
+```bash
+# Default seed (42)
+bash start_self_training.sh --dataset /path/to/dataset --rounds 10 --mode baseline
+
+# Pin the seed for explicit reproducibility (same seed → same trajectory)
+bash start_self_training.sh --dataset /path/to/dataset --rounds 10 \
+    --mode baseline --baseline-seed 7
+```
+
+The chosen params are sed-edited into `train.sh` and emitted as a
+`baseline-decision` event in `events.jsonl`. From train.sh's perspective
+nothing changes — same validator, same circuit breaker, same metric
+extraction, same held-out test eval.
+
+### How to compare two reports
+
+Run the agent and the baseline on the **same dataset, same rounds, same
+`--test-seed`** so the held-out test split is identical. Both produce a
+`projects/<name>/training_report.md`. Open them side-by-side and read three
+fields:
+
+| Field | Tells you |
+|---|---|
+| **Best Model** > primary metric | `uplift = mAP(agent) − mAP(baseline)` |
+| **Held-out test evals** > best test value | uplift held on data the agent never saw |
+| **Loop cost** > LLM cost / wall time | what the uplift cost in $$ + GPU time |
+
+If `uplift < 0.02` (typical YOLO val noise floor), the agent isn't doing
+anything random search wouldn't. If the test mAP doesn't move with val mAP,
+the agent is fitting val noise — see also Boundary 4 in
+[docs/architecture.md](architecture.md).
+
+### Caveats
+
+- **Variance on small val sets.** YOLO training is stochastic; identical
+  runs can move mAP ±0.02 between training seeds. If observed uplift is in
+  that noise floor, re-run baseline with 2–3 different `--baseline-seed`
+  values and take the max.
+- **Use the same `--test-split` and `--test-seed`.** Otherwise the test
+  sets differ and the comparison is apples-to-oranges.
+- **Round 1 = defaults.** Both modes start from the scaffolded params, so
+  round 1 numbers should match exactly (modulo training stochasticity).
+  Divergence appears from round 2 onward.
+- **BATCH stays at `-1` in baseline.** Auto-batch avoids burning rounds on
+  OOM exploration; if the agent is exploring batch sizes, that's an
+  agent-side decision not modeled in the baseline.
+
+---
+
 ## Where the best model lives
 
 The trained weights are in `runs/<task>/<run_name>/weights/best.pt`.

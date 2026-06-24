@@ -54,6 +54,9 @@ CLOSE_MOSAIC=10
 # run. Validate against the bounds in hyperparameter_strategy.md BEFORE
 # launching training. On failure we abort, wake Claude, and do NOT consume a
 # round (no train_completed touched).
+# KEEP IN SYNC with scripts/baseline_policy.py's BOUNDS dict.
+# This validator is the trust boundary (§5.1) — baseline_policy.py must
+# never propose a value the validator would reject.
 echo "[validator] checking train.sh parameters against hyperparameter_strategy.md bounds"
 export LR LR_FINAL EPOCHS PATIENCE IMGSZ BATCH DEGREES MOSAIC MIXUP \
        COPY_PASTE ERASING FLIPLR FLIPUD SCALE WEIGHT_DECAY OPTIMIZER
@@ -139,7 +142,12 @@ HALT_EOF
     exit 1
   fi
   echo "[train] Waking the agent to fix params (failure $FAILS/3)..." >&2
-  if [ -f "$SCRIPT_DIR/start_agent.sh" ]; then
+  # Order matters: only one start_*.sh exists per project; pick the most
+  # specific. start_baseline.sh skips the LLM entirely; agent uses run_agent.py;
+  # claude is the original CLI flow.
+  if [ -f "$SCRIPT_DIR/start_baseline.sh" ]; then
+    bash "$SCRIPT_DIR/start_baseline.sh"
+  elif [ -f "$SCRIPT_DIR/start_agent.sh" ]; then
     bash "$SCRIPT_DIR/start_agent.sh"
   else
     bash "$SCRIPT_DIR/start_claude.sh"
@@ -328,10 +336,13 @@ fi
 rm -f "$SCRIPT_DIR/train.pid"  # before recursive start_*.sh call
 echo "[train] Waking the agent loop..."
 touch "$SCRIPT_DIR/train_completed"
-# Auto-detect mode: agent mode scaffolds start_agent.sh; classic CLI mode
-# only has start_claude.sh. Either way, the round-counter / events / circuit
-# breaker are shared so the loop semantics are identical.
-if [ -f "$SCRIPT_DIR/start_agent.sh" ]; then
+# Auto-detect mode: baseline mode scaffolds start_baseline.sh; agent mode
+# scaffolds start_agent.sh; classic CLI mode only has start_claude.sh. The
+# round-counter / events / circuit breaker are shared, so loop semantics
+# match across modes — only the per-round "who picks params" step differs.
+if [ -f "$SCRIPT_DIR/start_baseline.sh" ]; then
+  bash "$SCRIPT_DIR/start_baseline.sh"
+elif [ -f "$SCRIPT_DIR/start_agent.sh" ]; then
   bash "$SCRIPT_DIR/start_agent.sh"
 else
   bash "$SCRIPT_DIR/start_claude.sh"

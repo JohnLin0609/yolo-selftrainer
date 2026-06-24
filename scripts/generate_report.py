@@ -81,6 +81,69 @@ def metric_runs(events: list[dict]) -> list[dict]:
     )
 
 
+def detect_mode(project_dir: Path, events: list[dict]) -> tuple[str, str]:
+    """Return (mode, detail) where mode ∈ {claude, agent, baseline}.
+
+    `detail` is a short suffix shown in the report header (e.g.
+    "random-search, seed=42" for baseline). Empty string for other modes.
+
+    Detection is via the scaffolded orchestrator file, NOT by scanning
+    events — a session with zero successful rounds still has a mode.
+    """
+    if (project_dir / "start_baseline.sh").exists():
+        # Pull policy + seed from the most recent baseline-decision event.
+        for ev in reversed(events):
+            if ev.get("type") == "baseline_decision":
+                policy = ev.get("policy", "?")
+                seed = ev.get("seed", "?")
+                return "baseline", f"{policy}, seed={seed}"
+        return "baseline", "no decisions yet"
+    if (project_dir / "start_agent.sh").exists():
+        return "agent", ""
+    return "claude", ""
+
+
+def _hms(seconds: float) -> str:
+    """H:MM:SS for the loop-cost table. Floors negatives to 0:00:00."""
+    s = max(0, int(seconds))
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def render_loop_cost(events: list[dict], mode: str, max_rounds: int | None) -> str:
+    """Mode-agnostic cost summary. Wall time comes from training_finished
+    events; LLM cost is "$0.00 (no agent)" for baseline and "n/a (not
+    tracked yet)" for claude/agent until cost parsing lands.
+    """
+    durations = [
+        float(e.get("duration_sec") or 0.0)
+        for e in events
+        if e.get("type") == "training_finished"
+    ]
+    total_sec = sum(durations)
+    n_runs = len(durations)
+    avg_sec = (total_sec / n_runs) if n_runs else 0.0
+
+    if mode == "baseline":
+        llm_cost = "$0.00 (no agent)"
+    else:
+        llm_cost = "n/a (not tracked yet)"
+
+    rounds_cell = f"{n_runs}" + (f" / {max_rounds}" if max_rounds else "")
+
+    return "\n".join([
+        "## Loop cost",
+        "",
+        "| Field | Value |",
+        "|---|---|",
+        f"| LLM cost (USD) | {llm_cost} |",
+        f"| Total training wall time | {_hms(total_sec)} |",
+        f"| Avg per round | {_hms(avg_sec)} |",
+        f"| Rounds completed | {rounds_cell} |",
+    ])
+
+
 def test_runs_by_name(events: list[dict]) -> dict[str, dict]:
     """Index test_metrics by run_name for joining with val (training) rows.
 
@@ -388,6 +451,24 @@ def render_insights(runs: list[dict], test_by_name: dict[str, dict] | None = Non
     return "\n".join(lines)
 
 
+def _read_max_rounds(project_dir: Path) -> int | None:
+    """Look up MAX_ROUNDS from whichever start_*.sh exists. Returns None if
+    not parseable — the Loop-cost table just omits the denominator then.
+    """
+    for fname in ("start_baseline.sh", "start_agent.sh", "start_claude.sh"):
+        f = project_dir / fname
+        if not f.exists():
+            continue
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("MAX_ROUNDS="):
+                try:
+                    return int(line.split("=", 1)[1].split()[0])
+                except (ValueError, IndexError):
+                    return None
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--project-dir", type=Path, required=True)
@@ -399,6 +480,10 @@ def main() -> int:
     events = read_events(args.project_dir)
     runs   = metric_runs(events)
     test_by_name = test_runs_by_name(events)
+    mode, mode_detail = detect_mode(args.project_dir, events)
+    max_rounds = _read_max_rounds(args.project_dir)
+
+    mode_label = f"{mode} ({mode_detail})" if mode_detail else mode
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     report_lines = [
@@ -406,6 +491,7 @@ def main() -> int:
         "",
         f"**Generated**: {timestamp}",
         f"**Project**: `{args.project_dir.name}`",
+        f"**Mode**: {mode_label}",
         f"**Task**: {args.task}",
         f"**Primary metric**: {TASK_PRIMARY_METRIC[args.task]}",
         f"**Total runs in this project**: {len(runs)}",
@@ -417,6 +503,8 @@ def main() -> int:
     report_lines.append("")
 
     report_lines.append(render_summary(runs, args.task, args.runs_dir))
+    report_lines.append("")
+    report_lines.append(render_loop_cost(events, mode, max_rounds))
     report_lines.append("")
     report_lines.append(render_metrics_table(runs, test_by_name))
     report_lines.append("")

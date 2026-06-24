@@ -33,6 +33,10 @@ Event types (use kebab-case on the CLI; underscore in the JSON):
                        best_metric_value, best_epoch, extras (JSON dict)
                        OPERATOR-ONLY — never consumed by build_prompt.py.
                        See scripts/build_prompt.py AGENT_INVISIBLE_EVENT_TYPES.
+  baseline-decision    round, policy, seed, params (JSON dict)
+                       Emitted by start_baseline.sh — records the LLM-free
+                       policy's choice for the round. Lets generate_report.py
+                       distinguish baseline runs from agent runs.
 
 Why we don't fancy schema-validate the payload:
   Harness §四 "fail loud" applies to safety; for an audit log we'd rather
@@ -64,6 +68,8 @@ EVENT_TYPES = {
     "session-resumed",
     # OPERATOR-ONLY — agent must never see this. See build_prompt.py.
     "test-metrics",
+    # Emitted by start_baseline.sh when the LLM-free policy picks params.
+    "baseline-decision",
 }
 
 
@@ -381,6 +387,9 @@ EVENT_FIELDS = {
     "test-metrics":      {"round": int,    "run_name": str,    "test_split_size": int,
                           "best_metric_name": str, "best_metric_value": float,
                           "best_epoch": int, "extras_json": "json"},
+    # LLM-free policy decision. `policy` is e.g. "defaults" or "random-search".
+    "baseline-decision": {"round": int,    "policy": str,      "seed": int,
+                          "params_json": "json"},
 }
 
 

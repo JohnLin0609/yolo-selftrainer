@@ -1,0 +1,189 @@
+#!/bin/bash
+# Do NOT use set -e — we need to keep the chain alive across train.sh crashes
+# so the circuit breaker (in train.sh) can do its job.
+#
+# LLM-free control loop. Same skeleton as start_claude.sh / start_agent.sh:
+# HALTED check → preflight → round counter → MAX_ROUNDS gate → train.sh launch.
+# The only difference: instead of asking an LLM for params, we call
+# scripts/baseline_policy.py for a seeded random sample inside the validator
+# bounds.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV="{{VENV_PATH}}"
+ROUND_FILE="$SCRIPT_DIR/round_counter"
+SESSION_FILE="$SCRIPT_DIR/session_id"
+LOGS_DIR="$SCRIPT_DIR/logs"
+MAX_ROUNDS={{MAX_ROUNDS}}
+BASELINE_SEED={{BASELINE_SEED}}
+
+FRAMEWORK_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+EVENT="python3 $FRAMEWORK_ROOT/scripts/event.py $SCRIPT_DIR"
+
+# ─── Circuit breaker check (shared with claude/agent modes) ──────────
+if [ -f "$SCRIPT_DIR/HALTED" ]; then
+  echo "[baseline] HALTED file present — loop will not run." >&2
+  cat "$SCRIPT_DIR/HALTED" >&2
+  exit 1
+fi
+
+# ─── Per-round preflight ────────────────────────────────────────────
+if ! bash "$FRAMEWORK_ROOT/scripts/preflight.sh" --quick "$SCRIPT_DIR"; then
+  cat > "$SCRIPT_DIR/HALTED" <<HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') — preflight failed before round.
+Most likely: disk filled up or GPU is in use by another process.
+
+To resume after fixing:
+  rm $SCRIPT_DIR/HALTED
+  bash $SCRIPT_DIR/start_baseline.sh
+HALT_EOF
+  $EVENT emit preflight-failed --round 0 --reason "disk-or-gpu" || true
+  $EVENT emit halted --reason preflight --details-json '{"check":"quick"}' || true
+  echo "[baseline] preflight failed — wrote HALTED" >&2
+  exit 1
+fi
+
+# Activate venv so python3 below picks up ultralytics (used by run_test_eval)
+source "$VENV/bin/activate"
+
+# ─── Round counter (identical semantics to start_claude.sh) ─────────
+ROUND=1
+if [ -f "$ROUND_FILE" ]; then
+  ROUND=$(cat "$ROUND_FILE")
+  if [ -f "$SCRIPT_DIR/train_completed" ]; then
+    ROUND=$((ROUND + 1))
+    rm -f "$SCRIPT_DIR/train_completed"
+  fi
+fi
+echo "$ROUND" > "$ROUND_FILE"
+
+# ─── Session ID ──────────────────────────────────────────────────────
+if [ "$ROUND" -eq 1 ] || [ ! -f "$SESSION_FILE" ]; then
+  SESSION_ID=$(date +%Y%m%d_%H%M%S)
+  echo "$SESSION_ID" > "$SESSION_FILE"
+else
+  SESSION_ID=$(cat "$SESSION_FILE")
+fi
+SESSION_LOG_DIR="$LOGS_DIR/$SESSION_ID"
+mkdir -p "$SESSION_LOG_DIR"
+rm -f "$SCRIPT_DIR/last_run_name"
+
+$EVENT emit round-started --round "$ROUND" --session-id "$SESSION_ID" || true
+
+echo "[baseline] =============================="
+echo "[baseline] Session: $SESSION_ID | Round $ROUND / $MAX_ROUNDS | seed=$BASELINE_SEED"
+
+# ─── MAX_ROUNDS gate (with auto-generated report on final round) ─────
+if [ "$ROUND" -gt "$MAX_ROUNDS" ]; then
+  echo "[baseline] MAX_ROUNDS ($MAX_ROUNDS) reached. Stopping loop."
+  echo "0" > "$ROUND_FILE"
+  rm -f "$SESSION_FILE"
+  exit 0
+fi
+
+# Generate report on final round, just like claude/agent modes. Fail-loud
+# (Harness §二) — surface the warn on stderr if the script errors, since
+# the report is the operator's only summary of the session.
+if [ "$ROUND" -eq "$MAX_ROUNDS" ]; then
+  REPORT_SCRIPT="$FRAMEWORK_ROOT/scripts/generate_report.py"
+  if [ -f "$REPORT_SCRIPT" ]; then
+    echo "[baseline] Generating training report..."
+    if ! python3 "$REPORT_SCRIPT" \
+        --project-dir "$SCRIPT_DIR" \
+        --runs-dir "{{RUNS_DIR}}/{{TASK}}" \
+        --task "{{TASK}}" \
+        --output "$SCRIPT_DIR/training_report.md"; then
+      echo "[baseline] WARN: training report generation failed" >&2
+    fi
+  fi
+fi
+
+# ─── Per-round log directory ─────────────────────────────────────────
+TEMP_LOG_DIR="$SESSION_LOG_DIR/round_${ROUND}_pending"
+mkdir -p "$TEMP_LOG_DIR"
+DECISION_OUT="$TEMP_LOG_DIR/decision.txt"
+
+# ─── Pick params via the LLM-free policy ─────────────────────────────
+if ! python3 "$FRAMEWORK_ROOT/scripts/baseline_policy.py" \
+     --round "$ROUND" --seed "$BASELINE_SEED" > "$DECISION_OUT"; then
+  echo "[baseline] FATAL: baseline_policy.py failed — cannot pick params" >&2
+  $EVENT emit halted --reason policy-error \
+    --details-json "{\"round\": $ROUND, \"seed\": $BASELINE_SEED}" || true
+  cat > "$SCRIPT_DIR/HALTED" <<POLICY_FAIL_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') — baseline_policy.py failed at round $ROUND.
+Inspect: python3 $FRAMEWORK_ROOT/scripts/baseline_policy.py --round $ROUND --seed $BASELINE_SEED
+POLICY_FAIL_EOF
+  exit 1
+fi
+
+POLICY=$(grep -oE '^#policy=[a-z-]+' "$DECISION_OUT" | head -1 | sed 's/^#policy=//')
+[ -z "$POLICY" ] && POLICY="unknown"
+
+# Apply each KEY=VALUE line by editing train.sh in place. Round 1 emits
+# only the #policy header (no KEY=VALUE lines) so the loop is a no-op
+# and train.sh keeps its scaffolded defaults — that's the "no-tuning floor".
+APPLIED=0
+while IFS='=' read -r k v; do
+  case "$k" in ''|'#'*) continue ;; esac
+  # | is the sed delimiter — baseline_policy.py never emits one, so plain
+  # interpolation is safe. Validator failures would be caught by train.sh's
+  # rng() block at the next launch (trust boundary §5.1).
+  if grep -qE "^${k}=" "$SCRIPT_DIR/train.sh"; then
+    sed -i "s|^${k}=.*|${k}=${v}|" "$SCRIPT_DIR/train.sh"
+    APPLIED=$((APPLIED + 1))
+  else
+    echo "[baseline] WARN: ${k}= not found in train.sh (skipped)" >&2
+  fi
+done < "$DECISION_OUT"
+
+echo "[baseline] policy=$POLICY applied=$APPLIED edits"
+
+# Emit the decision event. Single source of truth for "what did the
+# policy pick" — replaying events.jsonl shows it unambiguously.
+PARAMS_JSON=$(python3 - <<PYJSON
+import json
+d = {}
+for line in open("$DECISION_OUT"):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        continue
+    k, v = line.split("=", 1)
+    d[k] = v
+print(json.dumps(d))
+PYJSON
+)
+$EVENT emit baseline-decision --round "$ROUND" --policy "$POLICY" \
+  --seed "$BASELINE_SEED" --params-json "$PARAMS_JSON" || true
+
+# ─── Rename log dir using the future run_name written by train.sh ────
+# train.sh writes last_run_name early; we capture it after launch.
+
+# ─── Launch train.sh detached (same pattern Claude uses) ─────────────
+nohup bash "$SCRIPT_DIR/train.sh" > "$SCRIPT_DIR/current.log" 2>&1 &
+TRAIN_PID=$!
+echo "$TRAIN_PID" > "$SCRIPT_DIR/train.pid"
+echo "[baseline] launched train.sh (pid $TRAIN_PID); waiting for run_name..."
+
+# Give train.sh a moment to write last_run_name so we can rename the log dir.
+# Bounded wait — if train.sh crashes immediately, we just keep the pending name.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ -f "$SCRIPT_DIR/last_run_name" ] && break
+  sleep 1
+done
+
+if [ -f "$SCRIPT_DIR/last_run_name" ]; then
+  ACTUAL_RUN_NAME=$(cat "$SCRIPT_DIR/last_run_name")
+  FINAL_LOG_DIR="$SESSION_LOG_DIR/$ACTUAL_RUN_NAME"
+  if [ ! -d "$FINAL_LOG_DIR" ]; then
+    if mv "$TEMP_LOG_DIR" "$FINAL_LOG_DIR"; then
+      echo "[baseline] Logs: $FINAL_LOG_DIR/"
+    else
+      echo "[baseline] WARN: mv failed — logs remain at $TEMP_LOG_DIR/" >&2
+    fi
+  else
+    echo "[baseline] WARN: $FINAL_LOG_DIR already exists, keeping $TEMP_LOG_DIR/" >&2
+  fi
+else
+  echo "[baseline] Logs: $TEMP_LOG_DIR/ (no last_run_name yet — train.sh may have crashed)"
+fi
+
+echo "[baseline] orchestrator done; train.sh runs detached. Chain resumes when it exits."
