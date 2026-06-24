@@ -275,6 +275,69 @@ if [ $TRAIN_EXIT -eq 0 ]; then
         || echo "[test-eval] WARNING: failed; continuing chain"
     fi
   fi
+
+  # ─── Plateau circuit (independent of crash circuit breaker) ──────────
+  # Reads training_metrics history (q_plateau_status in event.py) to detect
+  # "primary metric stopped moving". Two outcomes:
+  #   action=emit-warn → emit a plateau-detected event so build_prompt.py
+  #                      injects an orthogonal-strategy nudge next round
+  #   action=halt      → grace rounds exhausted; write HALTED and emit
+  #                      halted --reason plateau so the chain stops cleanly
+  # Overrides via env: YOLO_TRAINER_PLATEAU_N / _THRESHOLD / _M.
+  PLATEAU_JSON=$($EVENT query plateau-status 2>/dev/null)
+  if [ -n "$PLATEAU_JSON" ]; then
+    PLATEAU_ACTION=$(printf '%s' "$PLATEAU_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("action",""))' 2>/dev/null)
+    case "$PLATEAU_ACTION" in
+      emit-warn)
+        echo "[plateau] WARN: improvement under threshold — emitting plateau-detected"
+        # Pull every numeric field once; pass each as a flag to event.py emit.
+        eval "$(printf '%s' "$PLATEAU_JSON" | python3 -c '
+import json, sys, shlex
+d = json.load(sys.stdin)
+for k in ("n","threshold","improvement","best_recent","best_before"):
+    v = d.get(k)
+    if v is None:
+        v = 0
+    print(f"PLATEAU_{k.upper()}={shlex.quote(str(v))}")')"
+        $EVENT emit plateau-detected --round "$ROUND" \
+          --n "$PLATEAU_N" --threshold "$PLATEAU_THRESHOLD" \
+          --improvement "$PLATEAU_IMPROVEMENT" \
+          --best-recent "$PLATEAU_BEST_RECENT" \
+          --best-before "$PLATEAU_BEST_BEFORE" \
+          || true
+        ;;
+      halt)
+        PLATEAU_M_USED=${YOLO_TRAINER_PLATEAU_M:-2}
+        echo "[plateau] HALT: $PLATEAU_M_USED grace rounds passed without improvement above threshold"
+        cat > "$SCRIPT_DIR/HALTED" <<PLATEAU_HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') — plateau circuit tripped.
+
+A plateau-detected event was emitted in an earlier round; \$YOLO_TRAINER_PLATEAU_M
+($PLATEAU_M_USED) grace rounds since then produced no improvement above
+threshold (YOLO_TRAINER_PLATEAU_THRESHOLD). This is NOT a crash — the agent
+exhausted the current direction without breaking through.
+
+Inspect the trajectory:
+  python3 $FRAMEWORK_ROOT/scripts/event.py $SCRIPT_DIR query metrics-table
+  python3 $FRAMEWORK_ROOT/scripts/event.py $SCRIPT_DIR query plateau-status
+
+Next step is operator judgement, not a fix-and-retry:
+  - collect more / cleaner data
+  - change the model architecture
+  - widen YOLO_TRAINER_PLATEAU_THRESHOLD if the noise floor is the issue
+
+To resume after deciding:
+  rm $SCRIPT_DIR/HALTED
+  bash $SCRIPT_DIR/start_*.sh
+PLATEAU_HALT_EOF
+        $EVENT emit halted --reason plateau \
+          --details-json "$PLATEAU_JSON" || true
+        touch "$SCRIPT_DIR/train_completed"
+        rm -f "$SCRIPT_DIR/train.pid"
+        exit 0
+        ;;
+    esac
+  fi
 else
   echo "[train] FAILED (exit code $TRAIN_EXIT) — diagnosing..." >&2
   PARAMS=$(grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER|DATASET)=' "$SCRIPT_DIR/train.sh")

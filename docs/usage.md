@@ -172,6 +172,41 @@ rm $PROJECT/HALTED $PROJECT/consecutive_failures
 bash $PROJECT/start_claude.sh    # or start_agent.sh
 ```
 
+### Plateau halts are different from crash halts
+
+If `$PROJECT/HALTED` says `plateau circuit tripped`, this is **not a bug to
+debug** — it means the framework noticed the primary metric stopped moving
+for N+M rounds (defaults N=3, M=2) and stopped the loop cleanly so it
+didn't burn the rest of your `--rounds` budget.
+
+```bash
+# Confirm it's a plateau halt
+grep plateau $PROJECT/HALTED
+
+# Inspect the trajectory the framework saw
+python3 scripts/event.py $PROJECT query plateau-status
+python3 scripts/event.py $PROJECT query metrics-table
+```
+
+You have three reasonable next steps:
+
+1. **Collect more / cleaner data.** Plateau usually means you're at the
+   dataset's information ceiling. More labelled examples or fixing noisy
+   labels in low-performing classes is the right lever.
+2. **Change architecture.** Swap model size, change task formulation, try
+   a different pretrained backbone.
+3. **Widen the plateau threshold.** If the val set is small and noisy and
+   you're convinced the agent has more room:
+   ```bash
+   YOLO_TRAINER_PLATEAU_THRESHOLD=0.002 bash $PROJECT/start_claude.sh
+   ```
+   The query reads the env var, so the same threshold applies to both
+   `train.sh`'s halt logic and `build_prompt.py`'s nudge. Other knobs:
+   `YOLO_TRAINER_PLATEAU_N` (window size, default 3) and
+   `YOLO_TRAINER_PLATEAU_M` (grace rounds after warning, default 2).
+
+To resume: `rm $PROJECT/HALTED && bash $PROJECT/start_*.sh`.
+
 ---
 
 ## Switching providers mid-session
@@ -305,3 +340,8 @@ cp "$BEST" /path/to/deployment/my_model.pt
   set EPOCHS=2000, you probably don't — see the discussion in
   [docs/local-llms.md](local-llms.md) about why short rounds beat long ones
   on small datasets.
+- **Don't `rm HALTED` and re-launch into a known plateau.** If the file
+  says `plateau circuit tripped`, the framework already gave the agent
+  N+M rounds to break through. Resuming without changing the dataset,
+  model size, or `YOLO_TRAINER_PLATEAU_THRESHOLD` will just hit the same
+  wall again. See "Recovering from HALTED → Plateau halts" above.

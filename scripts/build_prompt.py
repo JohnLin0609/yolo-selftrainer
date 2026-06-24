@@ -117,6 +117,89 @@ def runs_in_order(events: list[dict]) -> list[dict]:
     )
 
 
+def build_plateau_section(project: Path) -> str | None:
+    """Read the plateau circuit state and, while a warning is active, return
+    a high-visibility nudge that goes at the top of the prompt.
+
+    Returns None when state is not warn (insufficient / ok / halt — none of
+    those benefit from the nudge). Delegated to event.py via subprocess so
+    env-var overrides (YOLO_TRAINER_PLATEAU_*) apply identically to train.sh.
+    """
+    import subprocess
+    script = Path(__file__).resolve().parent / "event.py"
+    try:
+        out = subprocess.run(
+            ["python3", str(script), str(project), "query", "plateau-status"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        st = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+    if st.get("state") != "warn":
+        return None
+
+    n = st.get("n", 3)
+    threshold = float(st.get("threshold") or 0.0)
+    improvement = st.get("improvement")
+    # When the warning is active and no after-warn runs exist yet, the
+    # query reports improvement=null. Recover the delta from the warning
+    # event itself so the prompt always shows a concrete number.
+    if improvement is None:
+        for ev in reversed(load_events(project)):
+            if ev.get("type") == "plateau_detected":
+                improvement = ev.get("improvement")
+                break
+    m = int(st.get("m") or 2)
+    rounds_since = int(st.get("rounds_since_warn") or 0)
+    # Grace left: emit-warn is being delivered this round → all m rounds still
+    # ahead. Otherwise it's whatever m − rounds_since gives us, clamped ≥ 1
+    # so the prompt never reads "0 round(s) before halt" while it's still warn.
+    if st.get("action") == "emit-warn":
+        grace_left = m
+    else:
+        grace_left = max(1, m - rounds_since)
+
+    imp_str = "—" if improvement is None else f"{improvement:+.4f}"
+
+    return (
+        "## ⚠️ Plateau detected — switch to an orthogonal axis\n"
+        "> Operator-injected: the framework noticed the primary metric stopped\n"
+        "> moving over the last few rounds. This block is automatic; it is not\n"
+        "> from prior Claude notes.\n"
+        "\n"
+        f"Last N={n} rounds' best primary metric improved by {imp_str} "
+        f"(threshold {threshold:.4f}). Continued micro-adjustments along the\n"
+        f"same direction will waste the remaining **{grace_left} round(s)** before\n"
+        "the framework halts this session automatically.\n"
+        "\n"
+        "**DO NOT** this round:\n"
+        "- Tweak LR / momentum / weight_decay further in the same range\n"
+        "- Add another fraction-point of an augmentation you already touched\n"
+        "- Re-run with the same model size hoping for a different result\n"
+        "\n"
+        "**MUST** try ONE orthogonal lever this round:\n"
+        "1. **Augmentation regime change** — disable mosaic mid-train via\n"
+        "   `close_mosaic`, swap to a different augmentation mix (drop the\n"
+        "   dominant lever, raise a neglected one), or zero out an aug that\n"
+        "   may be hurting.\n"
+        "2. **Model size swap** — n→s or s→m if VRAM allows; or back off to\n"
+        "   n if you suspect underfitting at higher capacity.\n"
+        "3. **Re-examine the data** — is the val set noise-bounded? Is one\n"
+        "   class under-represented? Are labels noisy in specific classes?\n"
+        "   If so, STOP and write next_instruction.md describing the data\n"
+        "   work needed; do not launch another training run.\n"
+        "\n"
+        f"If you again propose adjustments in the same direction as the last\n"
+        f"N={n} runs, this round will be wasted and the chain will halt after\n"
+        f"{grace_left} more such round(s)."
+    )
+
+
 def fmt_metric(value, digits: int = 4) -> str:
     try:
         return f"{float(value):.{digits}f}"
@@ -328,6 +411,13 @@ def main() -> int:
     has_runs = any(e.get("type") == "training_metrics" for e in events)
 
     sections: list[str] = [f"# Round {args.round} of {args.max_rounds}"]
+
+    # Plateau nudge: high-visibility, comes BEFORE Verified facts so the
+    # agent reads it before any history. None when the warning is not
+    # currently active.
+    plateau_section = build_plateau_section(args.project)
+    if plateau_section:
+        sections.append(plateau_section)
 
     if has_runs:
         sections.append(build_facts_section(events))
