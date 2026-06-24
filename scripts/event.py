@@ -33,6 +33,16 @@ Event types (use kebab-case on the CLI; underscore in the JSON):
                        best_metric_value, best_epoch, extras (JSON dict)
                        OPERATOR-ONLY — never consumed by build_prompt.py.
                        See scripts/build_prompt.py AGENT_INVISIBLE_EVENT_TYPES.
+  baseline-decision    round, policy, seed, params (JSON dict)
+                       Emitted by start_baseline.sh — records the LLM-free
+                       policy's choice for the round. Lets generate_report.py
+                       distinguish baseline runs from agent runs.
+  plateau-detected     round, n, threshold, improvement, best_recent, best_before
+                       Emitted by train.sh when q_plateau_status reports
+                       state=warn. Agent-visible: build_prompt.py injects an
+                       orthogonal-strategy nudge into the next prompt while
+                       this warning is active. Cleared implicitly by a later
+                       training_metrics that improves by ≥ threshold.
 
 Why we don't fancy schema-validate the payload:
   Harness §四 "fail loud" applies to safety; for an audit log we'd rather
@@ -44,6 +54,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,6 +75,11 @@ EVENT_TYPES = {
     "session-resumed",
     # OPERATOR-ONLY — agent must never see this. See build_prompt.py.
     "test-metrics",
+    # Emitted by start_baseline.sh when the LLM-free policy picks params.
+    "baseline-decision",
+    # Emitted by train.sh's plateau circuit; consumed by build_prompt.py to
+    # inject the orthogonal-strategy nudge. Agent-visible by design.
+    "plateau-detected",
 }
 
 
@@ -160,6 +176,156 @@ def q_consecutive_failures(project: Path) -> int:
 
 def q_runs_history(project: Path) -> list[dict]:
     return [e for e in read_all(project) if e.get("type") == "training_metrics"]
+
+
+PLATEAU_N_DEFAULT = 3
+PLATEAU_THRESHOLD_DEFAULT = 0.005
+PLATEAU_M_DEFAULT = 2
+
+
+def q_plateau_status(
+    project: Path,
+    n: int = PLATEAU_N_DEFAULT,
+    threshold: float = PLATEAU_THRESHOLD_DEFAULT,
+    m: int = PLATEAU_M_DEFAULT,
+) -> dict:
+    """Plateau circuit state — independent of the crash circuit breaker.
+
+    Reads training_metrics + plateau_detected events from events.jsonl and
+    decides whether the loop has stopped progressing on the primary metric.
+
+    State machine (pure function of events):
+      - insufficient: < n+1 successful runs yet
+      - ok          : last-N improvement ≥ threshold, OR an active warning
+                      was cleared by a subsequent ≥-threshold jump
+      - warn        : last-N improvement < threshold and either no prior
+                      warning OR warning still pending grace
+      - halt        : warning previously emitted and ≥ m further runs since
+                      it have not improved by threshold
+
+    `action` tells callers what to do (decoupled from state for clarity):
+      - none      : nothing to emit
+      - emit-warn : emit a plateau-detected event (state just became warn)
+      - halt      : write HALTED + emit halted --reason plateau
+
+    Returns a JSON-serializable dict so the CLI can hand it to bash via
+    `event.py query plateau-status`.
+    """
+    runs = sorted(
+        (e for e in read_all(project) if e.get("type") == "training_metrics"),
+        key=lambda e: e.get("ts", ""),
+    )
+    base = {
+        "state": "insufficient",
+        "improvement": None,
+        "threshold": threshold,
+        "n": n,
+        "m": m,
+        "best_recent": None,
+        "best_before": None,
+        "rounds_since_warn": 0,
+        "action": "none",
+    }
+    if len(runs) < n + 1:
+        return base
+
+    events = read_all(project)
+    warn_event = next(
+        (e for e in reversed(events) if e.get("type") == "plateau_detected"),
+        None,
+    )
+
+    def _values(rs: list[dict]) -> list[float]:
+        out: list[float] = []
+        for r in rs:
+            v = r.get("best_metric_value")
+            if isinstance(v, (int, float)):
+                out.append(float(v))
+        return out
+
+    warning_active = False
+    if warn_event is not None:
+        # Compare by round number, not ts: timestamps are second-precision
+        # and sub-second emits collide, which would misclassify post-warn
+        # runs as pre-warn. Round numbers are monotonic and meaningful.
+        warn_round = warn_event.get("round")
+        if not isinstance(warn_round, int):
+            warn_round = -1
+        runs_at_or_before = [r for r in runs if int(r.get("round") or 0) <= warn_round]
+        runs_after        = [r for r in runs if int(r.get("round") or 0) >  warn_round]
+        vals_before = _values(runs_at_or_before)
+        vals_after = _values(runs_after)
+        if vals_after and vals_before:
+            jump = max(vals_after) - max(vals_before)
+            if jump >= threshold:
+                # Warning was implicitly cleared — fall through to fresh eval.
+                warning_active = False
+            else:
+                warning_active = True
+                base["best_before"] = max(vals_before)
+                base["best_recent"] = max(vals_after) if vals_after else None
+                base["improvement"] = (
+                    (max(vals_after) - max(vals_before)) if vals_after else None
+                )
+                base["rounds_since_warn"] = len(vals_after)
+                if len(vals_after) >= m:
+                    base["state"] = "halt"
+                    base["action"] = "halt"
+                else:
+                    base["state"] = "warn"
+                    base["action"] = "none"
+                return base
+        else:
+            # No runs after the warning yet — still warned, no grace consumed.
+            warning_active = True
+            base["best_before"] = max(vals_before) if vals_before else None
+            base["best_recent"] = None
+            base["improvement"] = None
+            base["rounds_since_warn"] = 0
+            base["state"] = "warn"
+            base["action"] = "none"
+            return base
+
+    # No active warning — compute fresh from the last N runs.
+    vals = _values(runs)
+    best_recent = max(vals[-n:])
+    best_before = max(vals[:-n]) if vals[:-n] else None
+    base["best_recent"] = best_recent
+    base["best_before"] = best_before
+    if best_before is None:
+        base["state"] = "ok"
+        base["improvement"] = None
+        return base
+    improvement = best_recent - best_before
+    base["improvement"] = improvement
+    if improvement < threshold:
+        base["state"] = "warn"
+        base["action"] = "emit-warn"
+    else:
+        base["state"] = "ok"
+    return base
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[event.py] WARN: {name}={raw!r} not int — using default {default}", file=sys.stderr)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "")
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[event.py] WARN: {name}={raw!r} not float — using default {default}", file=sys.stderr)
+        return default
 
 
 def q_metrics_table(project: Path) -> str:
@@ -381,6 +547,12 @@ EVENT_FIELDS = {
     "test-metrics":      {"round": int,    "run_name": str,    "test_split_size": int,
                           "best_metric_name": str, "best_metric_value": float,
                           "best_epoch": int, "extras_json": "json"},
+    # LLM-free policy decision. `policy` is e.g. "defaults" or "random-search".
+    "baseline-decision": {"round": int,    "policy": str,      "seed": int,
+                          "params_json": "json"},
+    # Plateau circuit warning. All values are pulled from q_plateau_status.
+    "plateau-detected":  {"round": int,    "n": int,           "threshold": float,
+                          "improvement": float, "best_recent": float, "best_before": float},
 }
 
 
@@ -436,8 +608,15 @@ def main() -> int:
     q.add_argument(
         "question",
         choices=["current-round", "last-metrics", "consecutive-failures",
-                 "runs-history", "metrics-table"],
+                 "runs-history", "metrics-table", "plateau-status"],
     )
+    # plateau-status overrides — env vars apply as defaults, CLI wins.
+    q.add_argument("--n",         type=int,   default=None,
+                   help="plateau-status: window size (default: env YOLO_TRAINER_PLATEAU_N or 3)")
+    q.add_argument("--threshold", type=float, default=None,
+                   help="plateau-status: improvement threshold (default: env YOLO_TRAINER_PLATEAU_THRESHOLD or 0.005)")
+    q.add_argument("--m",         type=int,   default=None,
+                   help="plateau-status: grace rounds after a warning (default: env YOLO_TRAINER_PLATEAU_M or 2)")
 
     em = sub.add_parser("extract-metrics", help="read results.csv and emit a training-metrics event")
     em.add_argument("--run-dir", type=Path, required=True)
@@ -464,6 +643,11 @@ def main() -> int:
             print(json.dumps(q_runs_history(args.project)))
         elif args.question == "metrics-table":
             print(q_metrics_table(args.project))
+        elif args.question == "plateau-status":
+            n = args.n         if args.n         is not None else _env_int("YOLO_TRAINER_PLATEAU_N", PLATEAU_N_DEFAULT)
+            t = args.threshold if args.threshold is not None else _env_float("YOLO_TRAINER_PLATEAU_THRESHOLD", PLATEAU_THRESHOLD_DEFAULT)
+            m = args.m         if args.m         is not None else _env_int("YOLO_TRAINER_PLATEAU_M", PLATEAU_M_DEFAULT)
+            print(json.dumps(q_plateau_status(args.project, n=n, threshold=t, m=m)))
         return 0
 
     if args.cmd == "extract-metrics":

@@ -33,6 +33,9 @@ LLM_API_BASE=""
 # Held-out test split (agent-invisible). 0 disables. Seed locks reproducibility.
 TEST_SPLIT="0.15"
 TEST_SEED="42"
+# Baseline-mode RNG seed (only used when --mode baseline). Same seed → same
+# random-search trajectory, so two baseline projects are byte-for-byte equal.
+BASELINE_SEED="42"
 
 # ─── Parse arguments ─────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -53,8 +56,9 @@ while [ $# -gt 0 ]; do
         --llm-provider) LLM_PROVIDER="$2"; shift 2 ;;
         --llm-model)    LLM_MODEL="$2"; shift 2 ;;
         --llm-api-base) LLM_API_BASE="$2"; shift 2 ;;
-        --test-split)   TEST_SPLIT="$2"; shift 2 ;;
-        --test-seed)    TEST_SEED="$2"; shift 2 ;;
+        --test-split)    TEST_SPLIT="$2"; shift 2 ;;
+        --test-seed)     TEST_SEED="$2"; shift 2 ;;
+        --baseline-seed) BASELINE_SEED="$2"; shift 2 ;;
         --force)         FORCE=true; shift ;;
         --auto-split)    AUTO_SPLIT=true; shift ;;
         --no-auto-split) NO_AUTO_SPLIT=true; AUTO_SPLIT=false; shift ;;
@@ -84,6 +88,10 @@ while [ $# -gt 0 ]; do
             echo "                     Test images are agent-invisible — used for post-hoc"
             echo "                     validation only, never feed into prompts."
             echo "  --test-seed SEED   RNG seed locking the test split (default: 42)"
+            echo "  --mode MODE        claude | agent | baseline (default: claude)"
+            echo "                     baseline = LLM-free control loop using"
+            echo "                     scripts/baseline_policy.py to pick params."
+            echo "  --baseline-seed N  RNG seed for --mode baseline (default: 42)"
             exit 0
             ;;
         *) echo "ERROR: Unknown argument: $1"; exit 1 ;;
@@ -1072,23 +1080,26 @@ DT2_EOF
 echo "[INFO] Filling templates..."
 mkdir -p "$PROJECT_DIR"
 # .claude/ is only needed in claude-CLI mode (for the PreToolUse hook).
-# Agent mode has no use for it (the guard runs as a subprocess from
-# run_agent.py instead).
+# Agent and baseline modes have no use for it (agent runs guard as a subprocess
+# from run_agent.py; baseline does not run an LLM at all).
 if [ "$LOOP_MODE" = "claude" ]; then
     mkdir -p "$PROJECT_DIR/.claude"
 fi
 
-# Common templates scaffolded in both modes
+# Common templates scaffolded in all modes
 COMMON_TMPLS=("train.sh" "yolo_folder_skill.md" "hyperparameter_strategy.md" ".gitignore")
 
-# Mode-specific orchestrator templates (P6):
-#   claude → start_claude.sh + .claude/settings.json (PreToolUse hook)
-#   agent  → start_agent.sh + agent.env (run_agent.py picks the LLM)
-# Both modes share train.sh; train.sh prefers start_agent.sh if it exists.
+# Mode-specific orchestrator templates:
+#   claude   → start_claude.sh + .claude/settings.json (PreToolUse hook)
+#   agent    → start_agent.sh + agent.env (run_agent.py picks the LLM)
+#   baseline → start_baseline.sh (LLM-free; baseline_policy.py picks params)
+# All modes share train.sh; the recursive call at the end of train.sh probes
+# baseline → agent → claude (most specific first).
 case "$LOOP_MODE" in
-    claude) MODE_TMPLS=("start_claude.sh") ;;
-    agent)  MODE_TMPLS=("start_agent.sh" "agent.env") ;;
-    *)      echo "ERROR: --mode must be 'claude' or 'agent' (got '$LOOP_MODE')" >&2; exit 1 ;;
+    claude)   MODE_TMPLS=("start_claude.sh") ;;
+    agent)    MODE_TMPLS=("start_agent.sh" "agent.env") ;;
+    baseline) MODE_TMPLS=("start_baseline.sh") ;;
+    *)        echo "ERROR: --mode must be 'claude' | 'agent' | 'baseline' (got '$LOOP_MODE')" >&2; exit 1 ;;
 esac
 
 for tmpl in "${COMMON_TMPLS[@]}" "${MODE_TMPLS[@]}"; do
@@ -1162,6 +1173,9 @@ for f in "$PROJECT_DIR"/*; do
     # P6 multi-LLM agent fields
     sed -i "s|{{LLM_PROVIDER}}|${LLM_PROVIDER}|g" "$f"
     sed -i "s|{{LLM_MODEL}}|${LLM_MODEL}|g" "$f"
+    # Baseline-mode seed (only meaningful in start_baseline.sh; the substitution
+    # is a no-op for other templates).
+    sed -i "s|{{BASELINE_SEED}}|${BASELINE_SEED}|g" "$f"
 done
 
 # settings.json is in .claude/ (claude mode only) so the per-file loop misses it.
@@ -1176,8 +1190,9 @@ fi
 
 # Make shell scripts executable — only the one(s) for the chosen mode
 chmod +x "$PROJECT_DIR/train.sh"
-[ -f "$PROJECT_DIR/start_claude.sh" ] && chmod +x "$PROJECT_DIR/start_claude.sh"
-[ -f "$PROJECT_DIR/start_agent.sh" ]  && chmod +x "$PROJECT_DIR/start_agent.sh"
+[ -f "$PROJECT_DIR/start_claude.sh" ]   && chmod +x "$PROJECT_DIR/start_claude.sh"
+[ -f "$PROJECT_DIR/start_agent.sh" ]    && chmod +x "$PROJECT_DIR/start_agent.sh"
+[ -f "$PROJECT_DIR/start_baseline.sh" ] && chmod +x "$PROJECT_DIR/start_baseline.sh"
 
 # ─── Verify no unreplaced placeholders ────────────────────────────────
 LEFTOVER=$(grep -rn '{{[A-Z_]*}}' "$PROJECT_DIR/" 2>/dev/null | grep -v '\.log' | grep -v 'next_instruction' || true)
@@ -1205,22 +1220,36 @@ echo ""
 
 echo "Syntax check..."
 bash -n "$PROJECT_DIR/train.sh" && echo "  train.sh: OK" || echo "  train.sh: SYNTAX ERROR"
-if [ "$LOOP_MODE" = "agent" ]; then
-    bash -n "$PROJECT_DIR/start_agent.sh" && echo "  start_agent.sh: OK" || echo "  start_agent.sh: SYNTAX ERROR"
-    LAUNCH_SCRIPT="start_agent.sh"
-else
-    bash -n "$PROJECT_DIR/start_claude.sh" && echo "  start_claude.sh: OK" || echo "  start_claude.sh: SYNTAX ERROR"
-    LAUNCH_SCRIPT="start_claude.sh"
-fi
+case "$LOOP_MODE" in
+    agent)
+        bash -n "$PROJECT_DIR/start_agent.sh" && echo "  start_agent.sh: OK" || echo "  start_agent.sh: SYNTAX ERROR"
+        LAUNCH_SCRIPT="start_agent.sh"
+        ;;
+    baseline)
+        bash -n "$PROJECT_DIR/start_baseline.sh" && echo "  start_baseline.sh: OK" || echo "  start_baseline.sh: SYNTAX ERROR"
+        LAUNCH_SCRIPT="start_baseline.sh"
+        ;;
+    *)
+        bash -n "$PROJECT_DIR/start_claude.sh" && echo "  start_claude.sh: OK" || echo "  start_claude.sh: SYNTAX ERROR"
+        LAUNCH_SCRIPT="start_claude.sh"
+        ;;
+esac
 
 echo ""
 echo "To start training:"
 echo "  cd $PROJECT_DIR && bash $LAUNCH_SCRIPT"
-if [ "$LOOP_MODE" = "agent" ]; then
-    echo ""
-    echo "Agent config: $PROJECT_DIR/agent.env (provider=$LLM_PROVIDER, model=$LLM_MODEL)"
-    echo "Make sure the appropriate API key env var is set (see comments in agent.env)."
-fi
+case "$LOOP_MODE" in
+    agent)
+        echo ""
+        echo "Agent config: $PROJECT_DIR/agent.env (provider=$LLM_PROVIDER, model=$LLM_MODEL)"
+        echo "Make sure the appropriate API key env var is set (see comments in agent.env)."
+        ;;
+    baseline)
+        echo ""
+        echo "Baseline config: random-search policy, seed=$BASELINE_SEED (no LLM)."
+        echo "Same --baseline-seed reproduces the same trajectory exactly."
+        ;;
+esac
 echo ""
 echo "To monitor:"
 echo "  tail -f $PROJECT_DIR/current.log"

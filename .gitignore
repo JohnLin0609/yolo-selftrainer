@@ -3,6 +3,7 @@
 
 # Pretrained model weights (large binaries)
 models/
+*.pt
 
 # Training run outputs
 runs/

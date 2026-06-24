@@ -172,6 +172,41 @@ rm $PROJECT/HALTED $PROJECT/consecutive_failures
 bash $PROJECT/start_claude.sh    # or start_agent.sh
 ```
 
+### Plateau halts are different from crash halts
+
+If `$PROJECT/HALTED` says `plateau circuit tripped`, this is **not a bug to
+debug** — it means the framework noticed the primary metric stopped moving
+for N+M rounds (defaults N=3, M=2) and stopped the loop cleanly so it
+didn't burn the rest of your `--rounds` budget.
+
+```bash
+# Confirm it's a plateau halt
+grep plateau $PROJECT/HALTED
+
+# Inspect the trajectory the framework saw
+python3 scripts/event.py $PROJECT query plateau-status
+python3 scripts/event.py $PROJECT query metrics-table
+```
+
+You have three reasonable next steps:
+
+1. **Collect more / cleaner data.** Plateau usually means you're at the
+   dataset's information ceiling. More labelled examples or fixing noisy
+   labels in low-performing classes is the right lever.
+2. **Change architecture.** Swap model size, change task formulation, try
+   a different pretrained backbone.
+3. **Widen the plateau threshold.** If the val set is small and noisy and
+   you're convinced the agent has more room:
+   ```bash
+   YOLO_TRAINER_PLATEAU_THRESHOLD=0.002 bash $PROJECT/start_claude.sh
+   ```
+   The query reads the env var, so the same threshold applies to both
+   `train.sh`'s halt logic and `build_prompt.py`'s nudge. Other knobs:
+   `YOLO_TRAINER_PLATEAU_N` (window size, default 3) and
+   `YOLO_TRAINER_PLATEAU_M` (grace rounds after warning, default 2).
+
+To resume: `rm $PROJECT/HALTED && bash $PROJECT/start_*.sh`.
+
 ---
 
 ## Switching providers mid-session
@@ -213,6 +248,70 @@ completed rounds are intact.
 
 ---
 
+## Measuring agent uplift with `--mode baseline`
+
+The agent (claude or litellm) decides hyperparameters each round. But is its
+reasoning actually beating a dumb random sampler over the same parameter
+space? Without a control, an mAP of 0.99 could be a real win, or just what
+any policy inside the validator bounds would have produced.
+
+`--mode baseline` runs the entire pipeline (preflight → train.sh → validator
+→ events → circuit breaker → report) **identically**, except the per-round
+hyperparameter choice comes from `scripts/baseline_policy.py` — a seeded
+random search inside the validator bounds, with round 1 fixed to the
+scaffolded defaults (the "no-tuning floor"). No LLM is called.
+
+### How to run
+
+```bash
+# Default seed (42)
+bash start_self_training.sh --dataset /path/to/dataset --rounds 10 --mode baseline
+
+# Pin the seed for explicit reproducibility (same seed → same trajectory)
+bash start_self_training.sh --dataset /path/to/dataset --rounds 10 \
+    --mode baseline --baseline-seed 7
+```
+
+The chosen params are sed-edited into `train.sh` and emitted as a
+`baseline-decision` event in `events.jsonl`. From train.sh's perspective
+nothing changes — same validator, same circuit breaker, same metric
+extraction, same held-out test eval.
+
+### How to compare two reports
+
+Run the agent and the baseline on the **same dataset, same rounds, same
+`--test-seed`** so the held-out test split is identical. Both produce a
+`projects/<name>/training_report.md`. Open them side-by-side and read three
+fields:
+
+| Field | Tells you |
+|---|---|
+| **Best Model** > primary metric | `uplift = mAP(agent) − mAP(baseline)` |
+| **Held-out test evals** > best test value | uplift held on data the agent never saw |
+| **Loop cost** > LLM cost / wall time | what the uplift cost in $$ + GPU time |
+
+If `uplift < 0.02` (typical YOLO val noise floor), the agent isn't doing
+anything random search wouldn't. If the test mAP doesn't move with val mAP,
+the agent is fitting val noise — see also Boundary 4 in
+[docs/architecture.md](architecture.md).
+
+### Caveats
+
+- **Variance on small val sets.** YOLO training is stochastic; identical
+  runs can move mAP ±0.02 between training seeds. If observed uplift is in
+  that noise floor, re-run baseline with 2–3 different `--baseline-seed`
+  values and take the max.
+- **Use the same `--test-split` and `--test-seed`.** Otherwise the test
+  sets differ and the comparison is apples-to-oranges.
+- **Round 1 = defaults.** Both modes start from the scaffolded params, so
+  round 1 numbers should match exactly (modulo training stochasticity).
+  Divergence appears from round 2 onward.
+- **BATCH stays at `-1` in baseline.** Auto-batch avoids burning rounds on
+  OOM exploration; if the agent is exploring batch sizes, that's an
+  agent-side decision not modeled in the baseline.
+
+---
+
 ## Where the best model lives
 
 The trained weights are in `runs/<task>/<run_name>/weights/best.pt`.
@@ -241,3 +340,8 @@ cp "$BEST" /path/to/deployment/my_model.pt
   set EPOCHS=2000, you probably don't — see the discussion in
   [docs/local-llms.md](local-llms.md) about why short rounds beat long ones
   on small datasets.
+- **Don't `rm HALTED` and re-launch into a known plateau.** If the file
+  says `plateau circuit tripped`, the framework already gave the agent
+  N+M rounds to break through. Resuming without changing the dataset,
+  model size, or `YOLO_TRAINER_PLATEAU_THRESHOLD` will just hit the same
+  wall again. See "Recovering from HALTED → Plateau halts" above.

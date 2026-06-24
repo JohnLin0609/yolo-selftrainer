@@ -209,6 +209,45 @@ To add a new operator-only event type, list it in
 `AGENT_INVISIBLE_EVENT_TYPES` AND add distinctive guard substrings to
 `_PROMPT_GUARD_TERMS` in the same file. Both must be updated together.
 
+### Boundary 5 — Plateau circuit
+
+The crash circuit breaker (Boundary 3) handles hard failures. Plateau is the
+quieter failure mode: the agent keeps proposing variations of the same
+direction and the primary metric stops moving. The plateau circuit is
+independent — keyed on training *success*, not failure — and additive to
+the crash breaker.
+
+State machine (`q_plateau_status` in `scripts/event.py`):
+
+```
+                  improvement ≥ threshold
+                  ┌──────────────────┐
+                  ▼                  │
+   insufficient → ok ── < threshold → warn ── m grace rounds → halt
+                                       ▲           passed       │
+                                       │                        │
+                                       └─── improvement ≥ ──────┘
+                                            threshold (cleared)
+```
+
+- **ok / insufficient**: no nudge, no halt.
+- **warn**: `train.sh` emits a `plateau-detected` event (once per fresh
+  warning). `build_prompt.py` injects a "switch to an orthogonal axis"
+  block at the top of every subsequent prompt while the warning is active.
+- **halt**: M consecutive `training_metrics` events after the warning
+  failed to improve by ≥ threshold. `train.sh` writes `HALTED`, emits
+  `halted --reason plateau`, and exits 0 (the run itself succeeded — the
+  chain stop is the feature).
+
+Defaults: N=3, threshold=0.005, M=2. Override via env vars
+`YOLO_TRAINER_PLATEAU_N` / `_THRESHOLD` / `_M`. The query reads them, so
+the same overrides apply to `train.sh` and `build_prompt.py` automatically.
+
+State lives entirely in `events.jsonl`. The warning is implicitly cleared
+when any post-warn `training_metrics` improves by ≥ threshold above the
+pre-warn best — no `plateau-cleared` event needed. `plateau-detected` is
+**not** firewalled (it's agent-visible by design — the nudge is the point).
+
 ---
 
 ## Multi-LLM via LiteLLM

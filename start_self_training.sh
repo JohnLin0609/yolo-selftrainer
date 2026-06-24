@@ -16,6 +16,8 @@ LLM_API_BASE=""
 # same dataset always carves the same test images across re-scaffolds.
 TEST_SPLIT="0.15"
 TEST_SEED="42"
+# Baseline-mode RNG seed (only used when --mode baseline).
+BASELINE_SEED="42"
 EXTRA_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -26,8 +28,9 @@ while [ $# -gt 0 ]; do
         --provider)     LLM_PROVIDER="$2"; shift 2 ;;
         --model)        LLM_MODEL="$2"; shift 2 ;;
         --api-base)     LLM_API_BASE="$2"; shift 2 ;;
-        --test-split)   TEST_SPLIT="$2"; shift 2 ;;
-        --test-seed)    TEST_SEED="$2"; shift 2 ;;
+        --test-split)    TEST_SPLIT="$2"; shift 2 ;;
+        --test-seed)     TEST_SEED="$2"; shift 2 ;;
+        --baseline-seed) BASELINE_SEED="$2"; shift 2 ;;
         -h|--help)
             cat <<'HELP_EOF'
 Usage: bash start_self_training.sh --dataset PATH [options]
@@ -35,16 +38,22 @@ Usage: bash start_self_training.sh --dataset PATH [options]
   --dataset PATH           Path to dataset directory (required)
   --rounds N               Number of training rounds (default: 10)
 
-P6 multi-LLM options:
-  --mode {claude,agent}    Agent loop implementation (default: claude)
-                             claude → uses `claude` CLI (Anthropic only)
-                             agent  → uses scripts/run_agent.py via litellm
-  --provider PROVIDER      LLM provider for agent mode:
+P6 multi-LLM / baseline options:
+  --mode MODE              Loop implementation (default: claude)
+                             claude   → uses `claude` CLI (Anthropic only)
+                             agent    → uses scripts/run_agent.py via litellm
+                             baseline → LLM-free control loop: picks params
+                                        from a seeded random search inside the
+                                        validator bounds. Used to measure how
+                                        much uplift the agent actually adds.
+  --provider PROVIDER      LLM provider (agent mode only):
                              anthropic | openai | gemini | groq | together_ai
                              ollama | vllm
-  --model MODEL            Model id for the chosen provider (e.g.
+  --model MODEL            Model id (agent mode only; e.g.
                              claude-opus-4-7, gpt-4o, qwen2.5:32b)
   --api-base URL           Custom OpenAI-compatible endpoint (vLLM / self-host)
+  --baseline-seed N        RNG seed for --mode baseline (default: 42).
+                             Same seed → same params → reproducible run.
 
 Held-out test split (agent-invisible, post-hoc validation only):
   --test-split RATIO       Fraction carved out as test set (default: 0.15).
@@ -79,8 +88,8 @@ done
 
 # Validate mode + LLM args
 case "$LOOP_MODE" in
-    claude|agent) ;;
-    *) echo "ERROR: --mode must be 'claude' or 'agent' (got '$LOOP_MODE')" >&2; exit 1 ;;
+    claude|agent|baseline) ;;
+    *) echo "ERROR: --mode must be 'claude' | 'agent' | 'baseline' (got '$LOOP_MODE')" >&2; exit 1 ;;
 esac
 if [ "$LOOP_MODE" = "agent" ]; then
     if [ -z "$LLM_PROVIDER" ] || [ -z "$LLM_MODEL" ]; then
@@ -162,6 +171,8 @@ SCAFFOLD_ARGS=(
 if [ "$LOOP_MODE" = "agent" ]; then
     SCAFFOLD_ARGS+=(--llm-provider "$LLM_PROVIDER" --llm-model "$LLM_MODEL")
     [ -n "$LLM_API_BASE" ] && SCAFFOLD_ARGS+=(--llm-api-base "$LLM_API_BASE")
+elif [ "$LOOP_MODE" = "baseline" ]; then
+    SCAFFOLD_ARGS+=(--baseline-seed "$BASELINE_SEED")
 fi
 SCAFFOLD_ARGS+=("${EXTRA_ARGS[@]}")
 
@@ -184,8 +195,8 @@ echo "========================================"
 echo ""
 
 cd "$PROJECT_DIR"
-if [ "$LOOP_MODE" = "agent" ]; then
-    exec bash start_agent.sh
-else
-    exec bash start_claude.sh
-fi
+case "$LOOP_MODE" in
+    agent)    exec bash start_agent.sh ;;
+    baseline) exec bash start_baseline.sh ;;
+    *)        exec bash start_claude.sh ;;
+esac
