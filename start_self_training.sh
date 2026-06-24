@@ -12,6 +12,10 @@ LOOP_MODE="claude"
 LLM_PROVIDER=""
 LLM_MODEL=""
 LLM_API_BASE=""
+# Held-out test split (agent-invisible). 0 disables. Seed is locked so the
+# same dataset always carves the same test images across re-scaffolds.
+TEST_SPLIT="0.15"
+TEST_SEED="42"
 EXTRA_ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -22,6 +26,8 @@ while [ $# -gt 0 ]; do
         --provider)     LLM_PROVIDER="$2"; shift 2 ;;
         --model)        LLM_MODEL="$2"; shift 2 ;;
         --api-base)     LLM_API_BASE="$2"; shift 2 ;;
+        --test-split)   TEST_SPLIT="$2"; shift 2 ;;
+        --test-seed)    TEST_SEED="$2"; shift 2 ;;
         -h|--help)
             cat <<'HELP_EOF'
 Usage: bash start_self_training.sh --dataset PATH [options]
@@ -39,6 +45,14 @@ P6 multi-LLM options:
   --model MODEL            Model id for the chosen provider (e.g.
                              claude-opus-4-7, gpt-4o, qwen2.5:32b)
   --api-base URL           Custom OpenAI-compatible endpoint (vLLM / self-host)
+
+Held-out test split (agent-invisible, post-hoc validation only):
+  --test-split RATIO       Fraction carved out as test set (default: 0.15).
+                             Set to 0 to disable. Test images NEVER feed back
+                             into prompts; the agent tunes only against val.
+  --test-seed SEED         RNG seed locking which images go to test
+                             (default: 42). Same seed → same test set across
+                             re-scaffolds, even after dataset reorganization.
 
 Everything else is auto-detected: task type, classes, resolution, model, split.
 Pass extra flags to new_project.sh after --:
@@ -142,6 +156,8 @@ SCAFFOLD_ARGS=(
     --max-rounds "$ROUNDS"
     --force
     --mode "$LOOP_MODE"
+    --test-split "$TEST_SPLIT"
+    --test-seed "$TEST_SEED"
 )
 if [ "$LOOP_MODE" = "agent" ]; then
     SCAFFOLD_ARGS+=(--llm-provider "$LLM_PROVIDER" --llm-model "$LLM_MODEL")

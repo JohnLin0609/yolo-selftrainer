@@ -81,6 +81,41 @@ def metric_runs(events: list[dict]) -> list[dict]:
     )
 
 
+def test_runs_by_name(events: list[dict]) -> dict[str, dict]:
+    """Index test_metrics by run_name for joining with val (training) rows.
+
+    This is OPERATOR-ONLY data — never feeds into prompts. The report
+    surfaces it so the human can compare val vs test progression and
+    spot val-overfitting that the agent (which never sees test) could
+    not catch.
+    """
+    out: dict[str, dict] = {}
+    for e in events:
+        if e.get("type") != "test_metrics":
+            continue
+        rn = e.get("run_name")
+        if rn:
+            # If duplicates (re-run test eval), keep the latest by ts.
+            existing = out.get(rn)
+            if existing is None or e.get("ts", "") > existing.get("ts", ""):
+                out[rn] = e
+    return out
+
+
+def _test_extras_value(test_event: dict | None, metric_key_substring: str):
+    """Pull a single metric out of a test event's extras dict by substring.
+
+    Returns None if no event, no extras, or no matching key.
+    """
+    if not test_event:
+        return None
+    extras = test_event.get("extras") or {}
+    for k, v in extras.items():
+        if metric_key_substring in k and isinstance(v, (int, float)):
+            return v
+    return None
+
+
 def read_args_yaml(run_dir: Path) -> dict[str, str]:
     """Minimal YAML-key reader for args.yaml (no pyyaml dependency)."""
     out: dict[str, str] = {}
@@ -137,10 +172,19 @@ def render_summary(runs: list[dict], task: str, runs_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def render_metrics_table(runs: list[dict]) -> str:
-    """Per-round table of ALL evaluation metrics at the best epoch."""
+def render_metrics_table(runs: list[dict], test_by_name: dict[str, dict] | None = None) -> str:
+    """Per-round table of ALL evaluation metrics at the best epoch.
+
+    When `test_by_name` (test_metrics indexed by run_name) is non-empty,
+    appends three columns: test_mAP50, test_mAP50-95, Δ(val−test). The
+    Δ column makes val-overfitting visible — large positive Δ means the
+    model does much better on val than test, which is the canonical
+    "val noise the agent fit to" failure mode.
+    """
     if not runs:
         return ""
+    test_by_name = test_by_name or {}
+    has_test = bool(test_by_name)
 
     # Union of extras keys, preserving first-seen order
     keys: list[str] = []
@@ -150,6 +194,8 @@ def render_metrics_table(runs: list[dict]) -> str:
                 keys.append(k)
     labels = [LABEL_MAP.get(k, k) for k in keys]
     header = ["#", "run_name", "ep", "Δ_primary"] + labels
+    if has_test:
+        header += ["test_mAP50", "test_mAP50-95", "Δ(val−test)"]
 
     lines = [
         "## Per-round metrics at best epoch",
@@ -157,6 +203,13 @@ def render_metrics_table(runs: list[dict]) -> str:
         "Every value is at the epoch where the primary metric peaked.",
         "`Δ_primary` shows the change in primary metric vs the previous run.",
         "`gap` = val_box_loss − train_box_loss (positive = overfitting).",
+    ]
+    if has_test:
+        lines.append(
+            "`Δ(val−test)` = val mAP50 − test mAP50. Large + means val is "
+            "easier than the held-out set — agent may be fitting val noise."
+        )
+    lines += [
         "",
         "| " + " | ".join(header) + " |",
         "|" + "|".join("---" for _ in header) + "|",
@@ -178,24 +231,81 @@ def render_metrics_table(runs: list[dict]) -> str:
         for k in keys:
             v = extras.get(k)
             cells.append(fmt(v) if isinstance(v, (int, float)) else "")
+        if has_test:
+            t = test_by_name.get(run_name)
+            t_map50 = _test_extras_value(t, "mAP50(B)")
+            # Distinguish mAP50 vs mAP50-95: the substring "mAP50-95" wins
+            # on the longer match. Pull both explicitly.
+            t_map50_95 = None
+            if t is not None:
+                for k, v in (t.get("extras") or {}).items():
+                    if "mAP50-95" in k and isinstance(v, (int, float)):
+                        t_map50_95 = v
+                        break
+                # And restrict t_map50 to the non-95 variant.
+                for k, v in (t.get("extras") or {}).items():
+                    if k.endswith("mAP50(B)") and isinstance(v, (int, float)):
+                        t_map50 = v
+                        break
+            val_map50 = None
+            for k, v in extras.items():
+                if k.endswith("mAP50(B)") and isinstance(v, (int, float)):
+                    val_map50 = v
+                    break
+            if val_map50 is not None and t_map50 is not None:
+                diff = val_map50 - t_map50
+                diff_str = f"{diff:+.4f}"
+            else:
+                diff_str = ""
+            cells.append(fmt(t_map50) if t_map50 is not None else "")
+            cells.append(fmt(t_map50_95) if t_map50_95 is not None else "")
+            cells.append(diff_str)
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
-def render_progression_bar_chart(runs: list[dict]) -> str:
-    """ASCII bar chart of primary-metric progression across rounds."""
+def render_progression_bar_chart(runs: list[dict], test_by_name: dict[str, dict] | None = None) -> str:
+    """ASCII bar chart of primary-metric progression across rounds.
+
+    When test_by_name is non-empty, draws two bars per round:
+      val  (filled █) — what the agent saw and optimized against
+      test (open ░)   — what the agent never saw; the unbiased benchmark
+    Divergence between the two bars at a glance flags val-overfitting.
+    """
     if not runs:
         return ""
-    values = [(r.get("round", i + 1), r.get("best_metric_value", 0.0) or 0.0)
+    test_by_name = test_by_name or {}
+    values = [(r.get("round", i + 1),
+               r.get("best_metric_value", 0.0) or 0.0,
+               r.get("run_name", ""))
               for i, r in enumerate(runs)]
-    best_v = max(v for _, v in values) or 1.0
+    # Normalize bars to the global peak across both val and test so the visual
+    # comparison is honest (can't make test bars look longer by scaling alone).
+    peak = max(v for _, v, _ in values)
+    for _, _, rn in values:
+        t = test_by_name.get(rn)
+        if t:
+            peak = max(peak, t.get("best_metric_value", 0.0) or 0.0)
+    if peak == 0:
+        peak = 1.0
     best_round = max(values, key=lambda x: x[1])[0]
 
     lines = ["## Primary metric progression", "", "```"]
-    for round_n, v in values:
-        bar_len = int(round((v / best_v) * 50))
-        marker = "  ← best" if round_n == best_round else ""
-        lines.append(f"  Round {round_n:>2} | {'█' * bar_len} {fmt(v)}{marker}")
+    has_test = bool(test_by_name)
+    for round_n, v, rn in values:
+        bar_len = int(round((v / peak) * 50))
+        marker = "  ← best (val)" if round_n == best_round else ""
+        if has_test:
+            lines.append(f"  Round {round_n:>2} val  | {'█' * bar_len} {fmt(v)}{marker}")
+            t = test_by_name.get(rn)
+            t_v = (t.get("best_metric_value", 0.0) or 0.0) if t else None
+            if t_v is not None:
+                t_bar = int(round((t_v / peak) * 50))
+                lines.append(f"           test | {'░' * t_bar} {fmt(t_v)}")
+            else:
+                lines.append(f"           test | (no test eval for this run)")
+        else:
+            lines.append(f"  Round {round_n:>2} | {'█' * bar_len} {fmt(v)}{marker}")
     lines.append("```")
     return "\n".join(lines)
 
@@ -229,10 +339,11 @@ def render_run_history_section(runs: list[dict], runs_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def render_insights(runs: list[dict]) -> str:
+def render_insights(runs: list[dict], test_by_name: dict[str, dict] | None = None) -> str:
     """Quick high-level observations the operator might miss."""
     if not runs:
         return ""
+    test_by_name = test_by_name or {}
     first_v = runs[0].get("best_metric_value", 0.0) or 0.0
     best_v  = max(r.get("best_metric_value", 0.0) or 0.0 for r in runs)
     pct_gain = ((best_v - first_v) / first_v * 100) if first_v else 0.0
@@ -241,7 +352,7 @@ def render_insights(runs: list[dict]) -> str:
     lines.append(f"- Total improvement: {fmt(first_v)} → {fmt(best_v)} "
                  f"({best_v - first_v:+.4f}, {pct_gain:+.1f}%)")
 
-    # Overfitting watch
+    # Overfitting watch (train↔val gap)
     last_gaps = [
         (r.get("round"), (r.get("extras") or {}).get("overfit_gap_box"))
         for r in runs[-3:]
@@ -249,7 +360,31 @@ def render_insights(runs: list[dict]) -> str:
     ]
     if last_gaps:
         gaps = ", ".join(f"r{n}={fmt(g, 3)}" for n, g in last_gaps)
-        lines.append(f"- Overfit gap last {len(last_gaps)} runs: {gaps}")
+        lines.append(f"- Overfit gap (val_box−train_box) last {len(last_gaps)} runs: {gaps}")
+
+    # Val↔test divergence (only shown when test eval ran)
+    if test_by_name:
+        divergences = []
+        for r in runs:
+            t = test_by_name.get(r.get("run_name", ""))
+            if t is None:
+                continue
+            v_map = r.get("best_metric_value", 0.0) or 0.0
+            t_map = t.get("best_metric_value", 0.0) or 0.0
+            divergences.append((r.get("round"), v_map - t_map))
+        if divergences:
+            last_div = ", ".join(f"r{n}={d:+.3f}" for n, d in divergences[-3:])
+            lines.append(
+                f"- Val−test divergence last {min(len(divergences),3)} runs: {last_div}"
+            )
+            # Flag growing divergence — the canonical val-overfitting signal.
+            if len(divergences) >= 2:
+                trend = divergences[-1][1] - divergences[0][1]
+                if trend > 0.02:
+                    lines.append(
+                        f"  ⚠️ divergence grew by {trend:+.3f} across the session — "
+                        f"agent may be fitting val noise (val improves faster than test)"
+                    )
     return "\n".join(lines)
 
 
@@ -263,6 +398,7 @@ def main() -> int:
 
     events = read_events(args.project_dir)
     runs   = metric_runs(events)
+    test_by_name = test_runs_by_name(events)
 
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     report_lines = [
@@ -273,18 +409,22 @@ def main() -> int:
         f"**Task**: {args.task}",
         f"**Primary metric**: {TASK_PRIMARY_METRIC[args.task]}",
         f"**Total runs in this project**: {len(runs)}",
-        "",
     ]
+    if test_by_name:
+        report_lines.append(
+            f"**Held-out test evals**: {len(test_by_name)} (agent never saw these)"
+        )
+    report_lines.append("")
 
     report_lines.append(render_summary(runs, args.task, args.runs_dir))
     report_lines.append("")
-    report_lines.append(render_metrics_table(runs))
+    report_lines.append(render_metrics_table(runs, test_by_name))
     report_lines.append("")
-    report_lines.append(render_progression_bar_chart(runs))
+    report_lines.append(render_progression_bar_chart(runs, test_by_name))
     report_lines.append("")
     report_lines.append(render_run_history_section(runs, args.runs_dir))
     report_lines.append("")
-    report_lines.append(render_insights(runs))
+    report_lines.append(render_insights(runs, test_by_name))
 
     args.output.write_text("\n".join(report_lines) + "\n")
     print(f"[generate_report] wrote {args.output}")

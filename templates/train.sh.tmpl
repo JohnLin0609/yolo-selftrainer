@@ -16,6 +16,9 @@ EVENT="python3 $FRAMEWORK_ROOT/scripts/event.py $SCRIPT_DIR"
 # Defaults to 0 if cache is missing; events.jsonl is the source of truth.
 ROUND=$(cat "$SCRIPT_DIR/round_counter" 2>/dev/null || echo 0)
 case "$ROUND" in ''|*[!0-9]*) ROUND=0 ;; esac
+# MAX_ROUNDS lets the post-hoc test-eval hook decide whether to fire on every
+# round or only the last one. Kept in sync with start_*.sh by the scaffold.
+MAX_ROUNDS={{MAX_ROUNDS}}
 
 # Parameters — edit these each cycle using sed
 WEIGHTS=${1:-"{{MODELS_DIR}}/{{PRIMARY_MODEL}}"}
@@ -231,6 +234,39 @@ if [ $TRAIN_EXIT -eq 0 ]; then
   # Read results.csv and emit a training_metrics event for P3/P5 consumers.
   $EVENT extract-metrics --run-dir "{{RUNS_DIR}}/{{TASK}}/$RUN_NAME" \
     --task "{{TASK}}" --round "$ROUND" --run-name "$RUN_NAME" || true
+
+  # ─── Post-hoc test eval on held-out split (AGENT-INVISIBLE) ──────────
+  # The resulting test_metrics event is firewalled from every prompt
+  # path by build_prompt.py (AGENT_INVISIBLE_EVENT_TYPES). Operator-only
+  # signal — never feeds back into the agent's tuning loop.
+  #
+  # Cadence:
+  #   YOLO_TRAINER_TEST_EVAL=every  (default) — every successful round
+  #   YOLO_TRAINER_TEST_EVAL=last             — only the final round
+  #   YOLO_TRAINER_TEST_EVAL=off              — never
+  # Failure is tolerated: a broken test eval prints a warning but does NOT
+  # halt the chain, since it's post-hoc reporting, not a trust-boundary.
+  if grep -qE "^\s*test:" "$DATASET"; then
+    CADENCE="${YOLO_TRAINER_TEST_EVAL:-every}"
+    case "$CADENCE" in
+      every) DO_TEST=true ;;
+      last)
+        if [ "$ROUND" -ge "$MAX_ROUNDS" ]; then DO_TEST=true; else DO_TEST=false; fi
+        ;;
+      off|*)  DO_TEST=false ;;
+    esac
+    if [ "$DO_TEST" = true ]; then
+      echo "[test-eval] evaluating best.pt on held-out test split"
+      python3 "$FRAMEWORK_ROOT/scripts/run_test_eval.py" \
+        --project "$SCRIPT_DIR" \
+        --best-pt "{{RUNS_DIR}}/{{TASK}}/$RUN_NAME/weights/best.pt" \
+        --data "$DATASET" \
+        --task "{{TASK}}" \
+        --round "$ROUND" \
+        --run-name "$RUN_NAME" \
+        || echo "[test-eval] WARNING: failed; continuing chain"
+    fi
+  fi
 else
   echo "[train] FAILED (exit code $TRAIN_EXIT) — diagnosing..." >&2
   PARAMS=$(grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER|DATASET)=' "$SCRIPT_DIR/train.sh")

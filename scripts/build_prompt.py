@@ -45,6 +45,38 @@ RECENT_RUNS_FULL = 3  # most recent N runs get full detail in the history sectio
 MAX_PROSE_CHARS = int(os.environ.get("YOLO_TRAINER_PROSE_BUDGET", "12000"))
 
 
+# ─── FIREWALL: operator-only event types ────────────────────────────────
+# These event types carry data the agent must NEVER see. Held-out test
+# split metrics are the canonical example — exposing them would defeat the
+# whole point of an unbiased post-hoc benchmark.
+#
+# The firewall has three independent layers:
+#   1. This denylist constant (single source of truth).
+#   2. load_events() drops these types unconditionally, so any downstream
+#      `for e in events` loop already-blind to them.
+#   3. main() scans the final assembled prompt for guard strings and aborts
+#      with a non-zero exit if any leak past the first two layers.
+#
+# If you add a new operator-only event type, add it here AND list a couple
+# of distinctive guard strings in _PROMPT_GUARD_TERMS below.
+AGENT_INVISIBLE_EVENT_TYPES = frozenset({
+    "test_metrics",
+})
+
+# Substrings that, if present in the final prompt, indicate a leak from
+# the firewall. Conservative — anything that resembles a test-eval keyword
+# is flagged. Update in lockstep with AGENT_INVISIBLE_EVENT_TYPES above.
+_PROMPT_GUARD_TERMS = (
+    "test_metrics",
+    "test-metrics",
+    "split=test",
+    "test_mAP",
+    "test mAP",
+    "held-out test",
+    "test split",
+)
+
+
 # Section headings in Claude-written next_instruction.md that we drop during
 # micro-compaction. The machine-facts section above already contains this
 # information verbatim, so keeping Claude's prose copy just wastes tokens.
@@ -65,11 +97,16 @@ def load_events(project: Path) -> list[dict]:
             if not line:
                 continue
             try:
-                out.append(json.loads(line))
+                ev = json.loads(line)
             except json.JSONDecodeError:
                 # The event log reader (event.py read_all) warns loudly; here
                 # we just skip — the prompt build should still succeed.
                 continue
+            # Firewall layer 2: drop operator-only events at the loading
+            # boundary so no downstream code can accidentally surface them.
+            if ev.get("type") in AGENT_INVISIBLE_EVENT_TYPES:
+                continue
+            out.append(ev)
     return out
 
 
@@ -325,7 +362,23 @@ def main() -> int:
             "3. Exit"
         )
 
-    print("\n\n".join(sections))
+    final_prompt = "\n\n".join(sections)
+
+    # Firewall layer 3: belt-and-braces — scan the assembled prompt for any
+    # operator-only guard terms. Layers 1+2 should make this impossible;
+    # this fires only on a future regression. Fail-loud (Harness §二):
+    # exit non-zero so the orchestrator notices instead of silently shipping
+    # a leaky prompt.
+    leaks = [t for t in _PROMPT_GUARD_TERMS if t in final_prompt]
+    if leaks:
+        print(
+            f"[build_prompt] FATAL: prompt contains operator-only term(s) {leaks!r} — "
+            "this indicates a firewall regression. Refusing to emit.",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(final_prompt)
     return 0
 
 

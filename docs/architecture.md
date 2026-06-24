@@ -170,6 +170,45 @@ failure 3/3 → write HALTED with diagnostic instructions, do NOT wake agent
 `start_*.sh` checks `HALTED` at the top of every wakeup and refuses to
 run until the operator removes it.
 
+### Boundary 4 — Operator-only data (held-out test split)
+
+The agent tunes against val metrics. If val is small or noisy, the agent
+can fit val without actually generalizing — and the framework has no way
+to tell. The held-out test split is an unbiased post-hoc benchmark that
+the agent **never sees**, so val-overfitting becomes visible to the
+operator.
+
+How the firewall is enforced:
+
+1. `scripts/new_project.sh` carves a fixed-seed test split at scaffold
+   time. Test images live in `images/test/` and `labels/test/`; the
+   yaml's `test:` key points at them. The split is locked by
+   `--test-seed` (default `42`) — same seed always yields the same test
+   set, so it stays comparable across re-scaffolds.
+
+2. `templates/train.sh.tmpl` calls `scripts/run_test_eval.py` after
+   each successful training run. The helper runs `yolo val split=test`
+   on `best.pt` and emits a `test_metrics` event into `events.jsonl`.
+
+3. `scripts/build_prompt.py` has three independent firewall layers
+   keyed on the constant `AGENT_INVISIBLE_EVENT_TYPES = {"test_metrics"}`:
+
+   - **Layer 1** (denylist): single source of truth at module top.
+   - **Layer 2** (load filter): `load_events()` drops invisible types,
+     so no downstream loop can accidentally read them.
+   - **Layer 3** (output sanity check): scans the assembled prompt for
+     guard strings (`test_metrics`, `split=test`, `test_mAP`, …) and
+     exits non-zero on any hit. This catches future regressions where
+     a contributor reads test data via a path other than `load_events`.
+
+4. `scripts/generate_report.py` reads `test_metrics` events (operator
+   tool — not agent-facing) and renders side-by-side val/test columns
+   plus a divergence-trend insight, so val-overfitting jumps out.
+
+To add a new operator-only event type, list it in
+`AGENT_INVISIBLE_EVENT_TYPES` AND add distinctive guard substrings to
+`_PROMPT_GUARD_TERMS` in the same file. Both must be updated together.
+
 ---
 
 ## Multi-LLM via LiteLLM

@@ -30,6 +30,9 @@ LOOP_MODE="claude"
 LLM_PROVIDER="anthropic"
 LLM_MODEL="claude-opus-4-7"
 LLM_API_BASE=""
+# Held-out test split (agent-invisible). 0 disables. Seed locks reproducibility.
+TEST_SPLIT="0.15"
+TEST_SEED="42"
 
 # ─── Parse arguments ─────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -50,6 +53,8 @@ while [ $# -gt 0 ]; do
         --llm-provider) LLM_PROVIDER="$2"; shift 2 ;;
         --llm-model)    LLM_MODEL="$2"; shift 2 ;;
         --llm-api-base) LLM_API_BASE="$2"; shift 2 ;;
+        --test-split)   TEST_SPLIT="$2"; shift 2 ;;
+        --test-seed)    TEST_SEED="$2"; shift 2 ;;
         --force)         FORCE=true; shift ;;
         --auto-split)    AUTO_SPLIT=true; shift ;;
         --no-auto-split) NO_AUTO_SPLIT=true; AUTO_SPLIT=false; shift ;;
@@ -75,6 +80,10 @@ while [ $# -gt 0 ]; do
             echo "  --kpt-shape STR    Keypoint shape for pose (e.g., '17 3')"
             echo "  --force            Overwrite existing project"
             echo "  --no-auto-split    Don't auto-split flat datasets (default: auto-split)"
+            echo "  --test-split RATIO Held-out test split fraction (default: 0.15; 0 disables)"
+            echo "                     Test images are agent-invisible — used for post-hoc"
+            echo "                     validation only, never feed into prompts."
+            echo "  --test-seed SEED   RNG seed locking the test split (default: 42)"
             exit 0
             ;;
         *) echo "ERROR: Unknown argument: $1"; exit 1 ;;
@@ -217,14 +226,34 @@ fi
 
 # ─── Check dataset split status ───────────────────────────────────────
 IS_SPLIT=false
+TEST_EXISTS=false
 if [ "$TASK" = "classify" ]; then
     if [ -d "$DATASET/train" ]; then
         IS_SPLIT=true
     fi
+    [ -d "$DATASET/test" ] && TEST_EXISTS=true
 else
     if [ -d "$DATASET/images/train" ]; then
         IS_SPLIT=true
     fi
+    [ -d "$DATASET/images/test" ] && TEST_EXISTS=true
+fi
+
+# Validate --test-split is a number in [0, 0.5]
+if ! python3 -c "
+v=float('$TEST_SPLIT')
+assert 0 <= v <= 0.5, f'--test-split {v} out of range [0, 0.5]'
+" 2>/dev/null; then
+    echo "ERROR: --test-split must be a number in [0, 0.5] (got '$TEST_SPLIT')" >&2
+    exit 1
+fi
+
+# Classify: not supported for now — disable test split silently.
+if [ "$TASK" = "classify" ] && [ "$TEST_EXISTS" = "false" ]; then
+    if [ "$TEST_SPLIT" != "0" ] && [ "$TEST_SPLIT" != "0.0" ]; then
+        echo "[INFO] --test-split disabled for classify task (not yet supported)"
+    fi
+    TEST_SPLIT="0"
 fi
 
 if [ "$IS_SPLIT" = "false" ]; then
@@ -233,45 +262,133 @@ if [ "$IS_SPLIT" = "false" ]; then
         echo "Remove --no-auto-split to auto-split 80/20, or split manually."
         exit 1
     fi
-    echo "[AUTO] Auto-splitting dataset 80/20..."
+    if [ "$TEST_SPLIT" = "0" ] || [ "$TEST_SPLIT" = "0.0" ]; then
+        echo "[AUTO] Auto-splitting dataset 80/20 (no test split)..."
+    else
+        echo "[AUTO] Auto-splitting dataset 3-way (test=$TEST_SPLIT, then 80/20 train/val)..."
+    fi
     if [ "$TASK" = "classify" ]; then
         echo "ERROR: Auto-split for classify datasets is not yet supported. Please split manually."
         exit 1
     fi
-        python3 -c "
-import random, shutil
+    TEST_SPLIT="$TEST_SPLIT" TEST_SEED="$TEST_SEED" DATASET="$DATASET" python3 - <<'PY'
+import os, random, shutil
 from pathlib import Path
-dataset_dir = Path('$DATASET')
+
+dataset_dir = Path(os.environ['DATASET'])
+test_ratio = float(os.environ['TEST_SPLIT'])
+test_seed  = int(os.environ['TEST_SEED'])
+
 src_images = dataset_dir / 'images'
 src_labels = dataset_dir / 'labels'
 if (src_images / 'train').is_dir():
-    print('Already split'); exit()
+    print('Already split'); raise SystemExit
+
 exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
-images = sorted([f for f in src_images.iterdir() if f.suffix.lower() in exts])
-random.seed(0); random.shuffle(images)
-split_idx = max(1, int(len(images) * 0.8))
-for subset, img_list in [('train', images[:split_idx]), ('val', images[split_idx:])]:
+images = sorted(f for f in src_images.iterdir() if f.suffix.lower() in exts)
+
+# Carve test first with a seed that's locked separately from train/val,
+# so the test set is stable even if train/val logic changes later.
+rng_test = random.Random(test_seed)
+rng_test.shuffle(images)
+n_test = int(len(images) * test_ratio)
+test_imgs = images[:n_test]
+rest      = images[n_test:]
+
+# Train/val split: keep the legacy seed=0 so existing projects (with
+# test_ratio=0) reproduce their old split byte-for-byte.
+rng_val = random.Random(0)
+rng_val.shuffle(rest)
+split_idx = max(1, int(len(rest) * 0.8))
+train_imgs = rest[:split_idx]
+val_imgs   = rest[split_idx:]
+
+subsets = [('train', train_imgs), ('val', val_imgs)]
+if test_imgs:
+    subsets.append(('test', test_imgs))
+
+for subset, img_list in subsets:
     (src_images / subset).mkdir(exist_ok=True)
     (src_labels / subset).mkdir(exist_ok=True)
     for img in img_list:
         shutil.move(str(img), str(src_images / subset / img.name))
         lbl = src_labels / (img.stem + '.txt')
-        if lbl.exists(): shutil.move(str(lbl), str(src_labels / subset / lbl.name))
-print(f'Split: train={split_idx}, val={len(images)-split_idx}')
-"
-        IS_SPLIT=true
+        if lbl.exists():
+            shutil.move(str(lbl), str(src_labels / subset / lbl.name))
+
+parts = [f'train={len(train_imgs)}', f'val={len(val_imgs)}']
+if test_imgs:
+    parts.append(f'test={len(test_imgs)}  (agent-invisible)')
+print('Split: ' + ', '.join(parts))
+PY
+    IS_SPLIT=true
+    [ -d "$DATASET/images/test" ] && TEST_EXISTS=true
+fi
+
+# Pre-split dataset that's missing a test split — carve it out of train using
+# the locked seed. The agent will train on fewer images but gains a held-out
+# unbiased benchmark. Skip silently when --test-split 0.
+if [ "$IS_SPLIT" = "true" ] && [ "$TEST_EXISTS" = "false" ] && [ "$TASK" != "classify" ] && \
+   [ "$TEST_SPLIT" != "0" ] && [ "$TEST_SPLIT" != "0.0" ]; then
+    echo "[AUTO] Carving $TEST_SPLIT of TRAIN into a held-out test split (seed=$TEST_SEED)..."
+    TEST_SPLIT="$TEST_SPLIT" TEST_SEED="$TEST_SEED" DATASET="$DATASET" python3 - <<'PY'
+import os, random, shutil
+from pathlib import Path
+
+dataset_dir = Path(os.environ['DATASET'])
+test_ratio = float(os.environ['TEST_SPLIT'])
+test_seed  = int(os.environ['TEST_SEED'])
+
+src_images = dataset_dir / 'images' / 'train'
+src_labels = dataset_dir / 'labels' / 'train'
+dst_images = dataset_dir / 'images' / 'test'
+dst_labels = dataset_dir / 'labels' / 'test'
+
+exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+images = sorted(f for f in src_images.iterdir() if f.suffix.lower() in exts)
+
+# Same RNG strategy as the 3-way split above — test_seed shuffles once,
+# first N% becomes test. Locked across runs.
+rng_test = random.Random(test_seed)
+rng_test.shuffle(images)
+n_test = int(len(images) * test_ratio)
+test_imgs = images[:n_test]
+
+dst_images.mkdir(exist_ok=True)
+dst_labels.mkdir(exist_ok=True)
+for img in test_imgs:
+    shutil.move(str(img), str(dst_images / img.name))
+    lbl = src_labels / (img.stem + '.txt')
+    if lbl.exists():
+        shutil.move(str(lbl), str(dst_labels / lbl.name))
+
+print(f'Carved test={len(test_imgs)} from train (agent-invisible).')
+PY
+    TEST_EXISTS=true
 fi
 
 # ─── Count images ────────────────────────────────────────────────────
+TEST_COUNT=0
 if [ "$TASK" = "classify" ]; then
     TRAIN_COUNT=$(find "$DATASET/train" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) | wc -l)
     VAL_COUNT=$(find "$DATASET/val" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) | wc -l)
+    [ -d "$DATASET/test" ] && TEST_COUNT=$(find "$DATASET/test" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" \) | wc -l)
 else
     TRAIN_COUNT=$(find "$DATASET/images/train" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.bmp" -o -name "*.tif" \) 2>/dev/null | wc -l)
     VAL_COUNT=$(find "$DATASET/images/val" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.bmp" -o -name "*.tif" \) 2>/dev/null | wc -l)
+    [ -d "$DATASET/images/test" ] && TEST_COUNT=$(find "$DATASET/images/test" -type f \( -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.bmp" -o -name "*.tif" \) 2>/dev/null | wc -l)
 fi
-TOTAL_COUNT=$((TRAIN_COUNT + VAL_COUNT))
-echo "[INFO] Dataset: $TRAIN_COUNT train + $VAL_COUNT val = $TOTAL_COUNT images"
+TOTAL_COUNT=$((TRAIN_COUNT + VAL_COUNT + TEST_COUNT))
+if [ "$TEST_COUNT" -gt 0 ]; then
+    echo "[INFO] Dataset: $TRAIN_COUNT train + $VAL_COUNT val + $TEST_COUNT test (agent-invisible) = $TOTAL_COUNT images"
+    # Warn (not block) — fewer than 30 test images is too noisy for per-class
+    # metrics. The session can still run; we just want the operator to know.
+    if [ "$TEST_COUNT" -lt 30 ]; then
+        echo "[WARN] Test split has only $TEST_COUNT images — per-class metrics will be very noisy. Consider a larger --test-split, or collect more data." >&2
+    fi
+else
+    echo "[INFO] Dataset: $TRAIN_COUNT train + $VAL_COUNT val = $TOTAL_COUNT images"
+fi
 
 # ─── Detect classes ───────────────────────────────────────────────────
 if [ -z "$CLASSES" ]; then
@@ -378,11 +495,12 @@ echo "[INFO] Creating dataset YAML..."
 mkdir -p "$ROOT_DIR/datasets/$NAME"
 
 if [ "$TASK" = "classify" ]; then
-    cat > "$DATASET_YAML_PATH" <<YAML_EOF
-path: $DATASET
-train: train
-val: val
-YAML_EOF
+    {
+        echo "path: $DATASET"
+        echo "train: train"
+        echo "val: val"
+        [ "$TEST_COUNT" -gt 0 ] && echo "test: test"
+    } > "$DATASET_YAML_PATH"
 elif [ "$TASK" = "pose" ]; then
     KPT_NUM=$(echo "$KPT_SHAPE" | awk '{print $1}')
     KPT_DIM=$(echo "$KPT_SHAPE" | awk '{print $2}')
@@ -390,6 +508,7 @@ elif [ "$TASK" = "pose" ]; then
         echo "path: $DATASET"
         echo "train: images/train"
         echo "val: images/val"
+        [ "$TEST_COUNT" -gt 0 ] && echo "test: images/test"
         echo ""
         echo "kpt_shape: [$KPT_NUM, $KPT_DIM]"
         echo ""
@@ -403,6 +522,7 @@ else
         echo "path: $DATASET"
         echo "train: images/train"
         echo "val: images/val"
+        [ "$TEST_COUNT" -gt 0 ] && echo "test: images/test"
         echo ""
         echo "names:"
         echo "$CLASSES" | tr ',' '\n' | while IFS=: read -r idx cname; do

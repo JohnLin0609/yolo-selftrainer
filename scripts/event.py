@@ -29,6 +29,10 @@ Event types (use kebab-case on the CLI; underscore in the JSON):
   preflight-failed     round, reason
   halted               reason, details (JSON dict)
   session-resumed      round, note
+  test-metrics         round, run_name, test_split_size, best_metric_name,
+                       best_metric_value, best_epoch, extras (JSON dict)
+                       OPERATOR-ONLY — never consumed by build_prompt.py.
+                       See scripts/build_prompt.py AGENT_INVISIBLE_EVENT_TYPES.
 
 Why we don't fancy schema-validate the payload:
   Harness §四 "fail loud" applies to safety; for an audit log we'd rather
@@ -58,6 +62,8 @@ EVENT_TYPES = {
     "preflight-failed",
     "halted",
     "session-resumed",
+    # OPERATOR-ONLY — agent must never see this. See build_prompt.py.
+    "test-metrics",
 }
 
 
@@ -371,6 +377,10 @@ EVENT_FIELDS = {
     "preflight-failed":  {"round": int,    "reason": str},
     "halted":            {"reason": str,   "details_json": "json"},
     "session-resumed":   {"round": int,    "note": str},
+    # OPERATOR-ONLY — held-out test split metrics. Firewalled from prompts.
+    "test-metrics":      {"round": int,    "run_name": str,    "test_split_size": int,
+                          "best_metric_name": str, "best_metric_value": float,
+                          "best_epoch": int, "extras_json": "json"},
 }
 
 
