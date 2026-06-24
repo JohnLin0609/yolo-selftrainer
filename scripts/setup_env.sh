@@ -80,6 +80,14 @@ if ! pip install "litellm>=1.45,<2" --quiet; then
     echo "ERROR: litellm install failed (needed for --mode agent). See output above." >&2
     exit 1
 fi
+# pytest + pytest-bdd power the test suite under tests/ — unit tests for the
+# Bash guard predicate and Gherkin scenarios for both bypass attempts and
+# the (future) sandbox isolation contract. Pinned to majors so future jumps
+# don't break test collection silently.
+if ! pip install "pytest>=8,<9" "pytest-bdd>=7,<8" --quiet; then
+    echo "ERROR: pytest / pytest-bdd install failed. See output above." >&2
+    exit 1
+fi
 echo "  Done."
 
 # ─── Verify installation ─────────────────────────────────────────────

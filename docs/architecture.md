@@ -116,7 +116,15 @@ an explicit `[... N chars omitted ...]` marker so the model knows.
 
 ## Trust boundaries
 
-The framework runs an LLM unattended. Three real boundaries (not advisory):
+The framework runs an LLM unattended. Boundaries 2 and 3 below are
+**deterministic gates** — they hard-fail any input outside their
+contract. **Boundary 1 (the Bash guard) is best-effort today** — a
+denylist of command heads plus train.sh-write regexes. It catches the
+obvious dangerous commands (`rm`, `sudo`, `pip`, …) but has known
+bypasses; do not treat it as the sole protection for sensitive paths.
+The canonical contract for the hardened guard lives in
+`tests/features/bypass_attempts.feature` and
+`tests/features/sandbox_isolation.feature`.
 
 ### Boundary 1 — Bash guard (`scripts/claude_bash_guard.py`)
 
@@ -143,6 +151,40 @@ The guard also rejects writes to `train.sh` via any mechanism (sed -i,
 > redirect, tee, awk -i inplace, perl -i, cp/mv into the path). The
 agent's contract is to write `next_params.json`; the guard is the wall
 that backs that contract up if the prompt regresses.
+
+#### Known gaps (Boundary 1 is denylist-based)
+
+The current head-token denylist is bypassable. Any of the following
+are **allowed** today and would let the agent reach arbitrary commands:
+
+- **Interpreter wrappers** — the head token is `python3` / `bash` / `sh` /
+  `eval`, not on the deny list, but the payload is arbitrary:
+  - `python3 -c "import os; os.remove('/x')"`
+  - `bash -c 'rm /x'`, `sh -c '...'`, `eval 'rm /x'`
+- **find primitives** — head is `find`, payload erases without invoking `rm`:
+  - `find . -delete`, `find / -exec rm {} \;`
+- **Embedded interpreters** in otherwise-benign tools:
+  - `awk 'BEGIN{system("rm /x")}' /dev/null`, `perl -e 'unlink "/x"'`
+- **xargs feeding a wrapper** — dangerous tail buried in argv:
+  - `xargs -I{} sh -c 'rm {}' < list.txt`
+- **Command substitution at the head position** — the outer guard sees
+  the substitution syntax, not the resolved command:
+  - `$(echo rm) -rf /x`, `` `echo rm` -rf /x ``
+- **Heredocs feeding an interpreter** — equivalent to `bash -c`:
+  - `bash <<'EOF'\nrm /x\nEOF`
+
+These cases are documented as `xfail` tests in
+`tests/unit/test_claude_bash_guard.py::test_bypass_attempts_blocked` and
+as scenarios in `tests/features/bypass_attempts.feature`. The xfail
+markers flip to passing tests when the predicate is hardened
+(approach 2 — allow-list) or when the agent's Bash runs inside an OS
+sandbox (approach 1 — container/namespace isolation). The contract
+for approach 1 lives in `tests/features/sandbox_isolation.feature`
+(SKIPPED today; auto-runs once `scripts/sandbox.run_in_sandbox` exists).
+
+Operational implication: **do not rely on Boundary 1 alone** for
+protecting host paths outside the project tree. Boundaries 2 and 3
+remain deterministic; Boundary 1 is a partial wall.
 
 ### Boundary 2 — Param contract (`next_params.json` + `apply_params.py`)
 
