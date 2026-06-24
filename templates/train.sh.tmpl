@@ -49,92 +49,41 @@ COPY_PASTE={{COPY_PASTE}}
 ERASING={{ERASING}}
 CLOSE_MOSAIC=10
 
-# ─── Parameter validation (Harness §5.1 trust boundary) ──────────────
-# Claude edits these with sed. A bad edit could waste 12 hours on a divergent
-# run. Validate against the bounds in hyperparameter_strategy.md BEFORE
-# launching training. On failure we abort, wake Claude, and do NOT consume a
-# round (no train_completed touched).
-# KEEP IN SYNC with scripts/baseline_policy.py's BOUNDS dict.
-# This validator is the trust boundary (§5.1) — baseline_policy.py must
-# never propose a value the validator would reject.
-echo "[validator] checking train.sh parameters against hyperparameter_strategy.md bounds"
-export LR LR_FINAL EPOCHS PATIENCE IMGSZ BATCH DEGREES MOSAIC MIXUP \
-       COPY_PASTE ERASING FLIPLR FLIPUD SCALE WEIGHT_DECAY OPTIMIZER
-python3 - <<'VALIDATE_PARAMS'
-import os, sys
-ok = True
-def fail(msg):
-    global ok
-    ok = False
-    print(f'  ✗ {msg}', file=sys.stderr)
-def rng(name, lo, hi, allow=()):
-    raw = os.environ.get(name, '')
-    if raw in allow:
-        return
-    try:
-        v = float(raw)
-    except ValueError:
-        fail(f"{name}={raw!r} is not a number"); return
-    if v < lo or v > hi:
-        fail(f"{name}={v} outside bounds [{lo}, {hi}]")
-rng('LR',           0.0001, 0.05)
-rng('LR_FINAL',     0.0001, 0.05)
-rng('EPOCHS',       50,     500)
-rng('PATIENCE',     20,     100)
-rng('IMGSZ',        640,    1280)
-rng('BATCH',        2,      64,    allow=('-1',))
-rng('DEGREES',      0.0,    45.0)
-rng('MOSAIC',       0.0,    1.0)
-rng('MIXUP',        0.0,    1.0)
-rng('COPY_PASTE',   0.0,    1.0)
-rng('ERASING',      0.0,    1.0)
-rng('FLIPLR',       0.0,    1.0)
-rng('FLIPUD',       0.0,    1.0)
-rng('SCALE',        0.0,    1.0)
-rng('WEIGHT_DECAY', 0.0,    0.005)
-try:
-    imgsz = int(float(os.environ['IMGSZ']))
-    if imgsz % 32 != 0:
-        fail(f"IMGSZ={imgsz} not a multiple of 32 (YOLO requirement)")
-except (ValueError, KeyError):
-    pass
-opt = os.environ.get('OPTIMIZER', '')
-if opt not in ('AdamW', 'SGD', 'auto'):
-    fail(f"OPTIMIZER={opt!r} not in {{'AdamW','SGD','auto'}}")
-sys.exit(0 if ok else 1)
-VALIDATE_PARAMS
+# ─── Parameter boundary (Harness §5.1 trust boundary) ────────────────
+# The agent's contract: write a flat JSON dict to next_params.json. It does
+# NOT edit train.sh. apply_params.py is the SOLE writer of effective_params.env
+# (the file sourced below), and reads the bounds from scripts/param_bounds.py
+# — the single source of truth shared with baseline_policy.py.
+#
+# On any validation failure apply_params emits a validation-failed event and
+# writes next_instruction.md telling the agent which key to fix. train.sh
+# only needs to handle the consecutive_failures counter + HALTED logic here.
+echo "[apply-params] validating next_params.json → effective_params.env"
+python3 "$FRAMEWORK_ROOT/scripts/apply_params.py" \
+    --project     "$SCRIPT_DIR" \
+    --task        "{{TASK}}" \
+    --round       "$ROUND" \
+    --next-params "$SCRIPT_DIR/next_params.json" \
+    --out         "$SCRIPT_DIR/effective_params.env"
 VALIDATE_EXIT=$?
 
 if [ "$VALIDATE_EXIT" -ne 0 ]; then
-  echo "[train] ABORT: parameter validation failed. Refusing to launch training." >&2
-  $EVENT emit validation-failed --round "$ROUND" --violations-json '{"see_log":"current.log"}' || true
-  cat > "$SCRIPT_DIR/next_instruction.md" <<VALIDATE_ABORT_EOF
-## Training ABORTED — parameters out of bounds
-
-train.sh refused to launch because one or more parameters violate the safety
-bounds in hyperparameter_strategy.md. Full validator output is in current.log.
-
-## Diagnose
-1. Show current params:
-   grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER|DEGREES|MOSAIC|MIXUP|COPY_PASTE|ERASING|FLIPLR|FLIPUD|SCALE|WEIGHT_DECAY)=' $SCRIPT_DIR/train.sh
-2. Re-read the "Parameter Bounds" table in hyperparameter_strategy.md
-3. Adjust the violating param back into range with sed
-4. Re-launch training with: nohup bash $SCRIPT_DIR/train.sh > $SCRIPT_DIR/current.log 2>&1 &
-
-This round did NOT consume a slot — fix and retry.
-VALIDATE_ABORT_EOF
-  # Failure counter: count validation failures the same as train crashes
+  echo "[train] ABORT: apply_params rejected next_params.json. Not launching." >&2
+  # apply_params has already (a) emitted the validation-failed event with
+  # the structured violations payload and (b) written next_instruction.md
+  # with the per-key fix-this guidance. We only handle the failure counter
+  # + HALTED check here. Round NOT consumed (no train_completed touched).
   FAILS=$(cat "$SCRIPT_DIR/consecutive_failures" 2>/dev/null || echo 0)
   FAILS=$((FAILS + 1))
   echo "$FAILS" > "$SCRIPT_DIR/consecutive_failures"
   if [ "$FAILS" -ge 3 ]; then
     cat > "$SCRIPT_DIR/HALTED" <<HALT_EOF
 HALTED at $(date '+%Y-%m-%d %H:%M:%S') after $FAILS consecutive failures.
-Last failure: parameter validation ($RUN_NAME never started).
+Last failure: parameter validation (no training run launched).
 
-To resume: fix train.sh params, then:
+To resume: ensure next_params.json is valid, then:
   rm $SCRIPT_DIR/HALTED $SCRIPT_DIR/consecutive_failures
-  bash $SCRIPT_DIR/start_claude.sh
+  bash $SCRIPT_DIR/start_*.sh
 HALT_EOF
     echo "[train] CIRCUIT BREAKER TRIPPED — $FAILS consecutive failures. Wrote HALTED." >&2
     $EVENT emit halted --reason circuit-breaker-validation \
@@ -152,6 +101,47 @@ HALT_EOF
   else
     bash "$SCRIPT_DIR/start_claude.sh"
   fi
+  exit 1
+fi
+
+# ─── Source the validated overrides ──────────────────────────────────
+# effective_params.env was written by apply_params.py above. It overrides
+# the scaffolded defaults at the top of this file with only the keys the
+# agent set in next_params.json. Missing keys keep their scaffolded values.
+# On round 1 cold start the file is empty (no agent picks yet).
+if [ -s "$SCRIPT_DIR/effective_params.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/effective_params.env"
+  set +a
+fi
+
+# ─── Defense-in-depth: re-validate via the same bounds source ────────
+# apply_params is the primary boundary; this CLI call catches the case
+# where it was bypassed (manual launch, broken script, future bug).
+# In normal operation this exits 0 — apply_params already enforced the
+# same bounds upstream. Failure here means the bounds source-of-truth
+# disagrees with the effective state, which is operator-investigate territory.
+if ! python3 "$FRAMEWORK_ROOT/scripts/param_bounds.py" validate-env \
+        --task "{{TASK}}" --weights "$WEIGHTS" 1>&2; then
+  echo "[train] FATAL: defense-in-depth param check failed AFTER apply_params succeeded." >&2
+  echo "[train] effective_params.env was tampered with, or apply_params/param_bounds disagree." >&2
+  $EVENT emit halted --reason defense-in-depth-validator \
+    --details-json '{"see":"current.log"}' || true
+  cat > "$SCRIPT_DIR/HALTED" <<DID_HALT_EOF
+HALTED at $(date '+%Y-%m-%d %H:%M:%S') — defense-in-depth validator caught
+a discrepancy between apply_params.py and scripts/param_bounds.py.
+
+In normal operation these agree; failure here is an operator concern, not
+something the agent can fix. Most likely causes:
+  - effective_params.env was edited by hand between apply_params and yolo
+  - param_bounds.py was updated to tighter bounds and apply_params still
+    used the older copy (cache or import issue)
+
+Inspect:
+  cat $SCRIPT_DIR/effective_params.env
+  python3 $FRAMEWORK_ROOT/scripts/param_bounds.py validate-env --task {{TASK}} --weights "$WEIGHTS"
+DID_HALT_EOF
   exit 1
 fi
 

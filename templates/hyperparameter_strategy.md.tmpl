@@ -1,6 +1,6 @@
 # Hyperparameter Strategy for Autonomous YOLO {{TASK}} Training Loop
 
-You are an autonomous training agent for **{{PROJECT_NAME}}**. Each cycle you read the last run's results, diagnose issues, adjust hyperparameters in train.sh using sed, and launch the next training run. Follow this strategy exactly.
+You are an autonomous training agent for **{{PROJECT_NAME}}**. Each cycle you read the last run's results, diagnose issues, and **write `next_params.json`** — a flat JSON object whose keys are your chosen hyperparameters for the next run. You do **NOT** edit `train.sh`. A scaffolded script (`scripts/apply_params.py`) reads `next_params.json`, validates it, and produces the effective parameter set; out-of-range or unknown keys reject the round (counts as a failure, does not consume a round slot).
 
 ## Context
 
@@ -9,6 +9,52 @@ You are an autonomous training agent for **{{PROJECT_NAME}}**. Each cycle you re
 - **Images**: {{IMAGE_INFO}}
 - **Previous best baseline**: {{PRIMARY_METRIC}}={{BASELINE_VALUE}}
 - **Goal**: Beat {{BASELINE_VALUE}} → push higher
+
+---
+
+## The parameter contract (READ THIS FIRST)
+
+Every round you produce ONE file:
+
+```
+{{PROJECT_DIR}}/next_params.json
+```
+
+It's a flat JSON object. All values are vetted against `scripts/param_bounds.py` (single source of truth). The validator is task-aware AND fine-tune-aware — fine-tuning from `best.pt` opens up shorter `EPOCHS`; pose tightens `DEGREES`; classify zeros out `MOSAIC`/`COPY_PASTE`.
+
+**Required keys** (omit any → round rejected, no slot consumed, you wake again to fix):
+
+| Key | Type | Notes |
+|---|---|---|
+| `WEIGHTS` | string (path) | A `.pt` file. End in `/best.pt` to mark it as a fine-tune. |
+| `EPOCHS` | int | Cold-start ≥ 50, fine-tune from `best.pt` ≥ 10, all ≤ 500. |
+| `PATIENCE` | int | 20–100. |
+| `LR` | float | 0.0001–0.05 (log scale of effect). |
+| `LR_FINAL` | float | 0.0001–0.05; typically same as `LR`. |
+| `IMGSZ` | int | 640–1280, multiple of 32. |
+| `BATCH` | int | 2–64, or `-1` for auto (recommended). |
+| `OPTIMIZER` | string | `"AdamW"`, `"SGD"`, or `"auto"`. Prefer `"AdamW"` — `"auto"` overrides your LR. |
+
+**Optional keys** (omit → previous scaffolded value persists):
+
+`MOSAIC`, `MIXUP`, `COPY_PASTE`, `ERASING`, `FLIPLR`, `FLIPUD`, `SCALE`, `DEGREES` (all 0.0–1.0 except DEGREES 0.0–45.0), `WEIGHT_DECAY` (0.0–0.005), `MOMENTUM` (0.6–0.999), `WARMUP_EPOCHS` (0.0–10.0), `WARMUP_MOMENTUM` (0.0–1.0), `HSV_H` (0.0–0.1), `HSV_S` (0.0–0.9), `HSV_V` (0.0–0.9), `TRANSLATE` (0.0–0.5), `CLOSE_MOSAIC` (0–100), `COS_LR` (`"true"`/`"false"`).
+
+To inspect the resolved bounds for this task:
+
+```bash
+python3 {{ROOT_DIR}}/scripts/param_bounds.py show --task {{TASK}}
+# or with fine-tune mode:
+python3 {{ROOT_DIR}}/scripts/param_bounds.py show --task {{TASK}} --fine-tune
+```
+
+You launch training exactly as before:
+
+```bash
+nohup bash {{PROJECT_DIR}}/train.sh > {{PROJECT_DIR}}/current.log 2>&1 &
+echo $! > {{PROJECT_DIR}}/train.pid
+```
+
+train.sh runs `apply_params.py` internally before yolo train fires.
 
 ---
 
@@ -51,46 +97,69 @@ Apply **ONE primary action** per cycle. Avoid changing too many things at once.
 
 ## Action Playbook
 
+Each Action shows a **complete** `next_params.json` you can Write directly. The required-key set is always present; optional augmentation keys appear only when the Action is changing them. Pick the JSON whose `## When` matches your situation.
+
 ### Action A: Adjust Learning Rate
 
-**When**: {{PRIMARY_METRIC}} plateaued, or starting with a new model
+**When**: {{PRIMARY_METRIC}} plateaued, or starting with a new model.
 
-```bash
-# Lower LR for fine-tuning ({{PRIMARY_METRIC}} above good threshold)
-sed -i 's/^LR=.*/LR=0.005/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^LR_FINAL=.*/LR_FINAL=0.005/' {{PROJECT_DIR}}/train.sh
+```json
+// Lower LR for fine-tuning ({{PRIMARY_METRIC}} above good threshold)
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.005, "LR_FINAL": 0.005,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
+```
 
-# Even lower for deep fine-tuning
-sed -i 's/^LR=.*/LR=0.001/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^LR_FINAL=.*/LR_FINAL=0.001/' {{PROJECT_DIR}}/train.sh
+```json
+// Even lower for deep fine-tuning
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.001, "LR_FINAL": 0.001,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
+```
 
-# Higher LR to escape plateau (stuck for 2+ runs)
-sed -i 's/^LR=.*/LR=0.02/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^LR_FINAL=.*/LR_FINAL=0.01/' {{PROJECT_DIR}}/train.sh
+```json
+// Higher LR to escape plateau (stuck for 2+ runs)
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.02, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
 ```
 
 **LR Guide:**
-| Situation | lr0 | lrf | Notes |
-|-----------|-----|-----|-------|
+
+| Situation | LR | LR_FINAL | Notes |
+|---|---|---|---|
 | First run, pretrained model | 0.01 | 0.01 | Standard start |
 | Fine-tuning from best.pt | 0.005 | 0.005 | Halve the LR |
 | Deep fine-tuning | 0.001 | 0.001 | Micro-adjustments |
 | Plateau escape attempt | 0.02 | 0.01 | Shake things up |
 | After model architecture swap | 0.01 | 0.01 | Reset for new arch |
-| After switching dataset | 0.01 | 0.01 | Labels changed, reset LR |
 
 ### Action B: Increase Epochs / Patience
 
 **When**: Patience triggered early but {{PRIMARY_METRIC}} still improving.
 
-```bash
-sed -i 's/^EPOCHS=.*/EPOCHS=200/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^PATIENCE=.*/PATIENCE=60/' {{PROJECT_DIR}}/train.sh
+```json
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 200, "PATIENCE": 60,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
 ```
 
 **Epochs Guide:**
-| Phase | Epochs | Patience | Notes |
-|-------|--------|----------|-------|
+
+| Phase | EPOCHS | PATIENCE | Notes |
+|---|---|---|---|
 | Initial exploration | 100 | 50 | Fast first look |
 | Good first result | 150 | 60 | Extend if still improving |
 | Fine-tuning best.pt | 200 | 60 | Longer for convergence |
@@ -100,52 +169,97 @@ sed -i 's/^PATIENCE=.*/PATIENCE=60/' {{PROJECT_DIR}}/train.sh
 
 **When**: {{PRIMARY_METRIC}} plateaued for 2+ runs with current model, and NOT overfitting.
 
-```bash
-# Primary model
-sed -i 's|^WEIGHTS=.*|WEIGHTS=${1:-"{{MODELS_DIR}}/{{PRIMARY_MODEL}}"}|' {{PROJECT_DIR}}/train.sh
+```json
+// Primary model
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 150, "PATIENCE": 60,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
+```
 
-# Fallback model (only if primary has plateaued for 3+ runs)
-sed -i 's|^WEIGHTS=.*|WEIGHTS=${1:-"{{MODELS_DIR}}/{{FALLBACK_MODEL}}"}|' {{PROJECT_DIR}}/train.sh
+```json
+// Fallback model (only if primary has plateaued for 3+ runs)
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{FALLBACK_MODEL}}",
+  "EPOCHS": 150, "PATIENCE": 60,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
 ```
 
 **When swapping architecture:**
 - Only swap if current model has plateaued for 3+ runs
 - Use pretrained weights, NOT previous best.pt (architectures differ)
-- Reset LR to 0.01 / lrf to 0.01
+- Reset LR to 0.01 / LR_FINAL to 0.01
 - Reset EPOCHS to 150, PATIENCE to 60
 
 ### Action D: Fight Overfitting
 
 **When**: val_loss >> train_loss (gap > 1.0), or {{PRIMARY_METRIC}} dropping while train_loss falls.
 
-```bash
-sed -i 's/^MOSAIC=.*/MOSAIC=1.0/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^MIXUP=.*/MIXUP=0.15/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^ERASING=.*/ERASING=0.5/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^COPY_PASTE=.*/COPY_PASTE=0.1/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^WEIGHT_DECAY=.*/WEIGHT_DECAY=0.001/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^LR=.*/LR=0.005/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^PATIENCE=.*/PATIENCE=30/' {{PROJECT_DIR}}/train.sh
+```json
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 30,
+  "LR": 0.005, "LR_FINAL": 0.005,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW",
+  "MOSAIC": 1.0,
+  "MIXUP": 0.15,
+  "ERASING": 0.5,
+  "COPY_PASTE": 0.1,
+  "WEIGHT_DECAY": 0.001
+}
 ```
 
 ### Action E: Adjust Batch Size
 
 **When**: OOM errors, or want to change gradient dynamics.
 
-```bash
-sed -i 's/^BATCH=.*/BATCH=-1/' {{PROJECT_DIR}}/train.sh    # auto (recommended)
-sed -i 's/^BATCH=.*/BATCH=4/' {{PROJECT_DIR}}/train.sh     # force smaller (OOM)
-sed -i 's/^BATCH=.*/BATCH=16/' {{PROJECT_DIR}}/train.sh    # larger for smoother gradients
+```json
+// Auto (recommended)
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
+```
+
+```json
+// Force smaller (OOM)
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": 4, "OPTIMIZER": "AdamW"
+}
+```
+
+```json
+// Larger for smoother gradients
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": 16, "OPTIMIZER": "AdamW"
+}
 ```
 
 ### Action F: Resume from Best Weights
 
 **When**: Fine-tuning the best model found so far.
 
-```bash
-BEST_PT=$(ls -td {{RUNS_DIR}}/{{TASK}}/*/ | head -1)/weights/best.pt
-nohup bash {{PROJECT_DIR}}/train.sh "$BEST_PT" > {{PROJECT_DIR}}/current.log 2>&1 &
-echo $! > {{PROJECT_DIR}}/train.pid
+```json
+// Point WEIGHTS at the prior best.pt. The validator detects this is a
+// fine-tune (path ends in /best.pt) and relaxes the EPOCHS floor to 10.
+{
+  "WEIGHTS": "{{RUNS_DIR}}/{{TASK}}/<PRIOR_RUN_NAME>/weights/best.pt",
+  "EPOCHS": 50, "PATIENCE": 30,
+  "LR": 0.005, "LR_FINAL": 0.005,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
 ```
 
 **Important**: When using best.pt, ALWAYS reduce LR (typically halve it).
@@ -154,14 +268,24 @@ echo $! > {{PROJECT_DIR}}/train.pid
 
 **When**: Small objects being missed (increase) or OOM (decrease).
 
-```bash
-sed -i 's/^IMGSZ=.*/IMGSZ=1024/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^BATCH=.*/BATCH=-1/' {{PROJECT_DIR}}/train.sh
+```json
+// Increase to 1024 — high-impact lever for high-res sources
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": 1024, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
+```
 
-sed -i 's/^IMGSZ=.*/IMGSZ=1280/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^BATCH=.*/BATCH=-1/' {{PROJECT_DIR}}/train.sh
-
-sed -i 's/^IMGSZ=.*/IMGSZ=640/' {{PROJECT_DIR}}/train.sh   # back to default
+```json
+// Push to 1280 (must remain a multiple of 32)
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": 1280, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
 ```
 
 **Note**: If original images are high-res, IMGSZ is a HIGH-IMPACT lever.
@@ -182,10 +306,23 @@ sed -i 's/^IMGSZ=.*/IMGSZ=640/' {{PROJECT_DIR}}/train.sh   # back to default
 
 **When**: Default optimizer is stuck.
 
-```bash
-sed -i 's/^OPTIMIZER=.*/OPTIMIZER="AdamW"/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^OPTIMIZER=.*/OPTIMIZER="SGD"/' {{PROJECT_DIR}}/train.sh
-sed -i 's/^OPTIMIZER=.*/OPTIMIZER="auto"/' {{PROJECT_DIR}}/train.sh
+```json
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "SGD"
+}
+```
+
+```json
+// "auto" overrides your LR settings — avoid unless you know what you're doing.
+{
+  "WEIGHTS": "{{MODELS_DIR}}/{{PRIMARY_MODEL}}",
+  "EPOCHS": 100, "PATIENCE": 50,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "auto"
+}
 ```
 
 ---
@@ -198,30 +335,31 @@ sed -i 's/^OPTIMIZER=.*/OPTIMIZER="auto"/' {{PROJECT_DIR}}/train.sh
 
 ## Lessons Learned (from prior sessions)
 
-1. **`optimizer=auto` overrides lr0 to 0.002** — ALWAYS use OPTIMIZER="AdamW" explicitly to control LR
+1. **`optimizer=auto` overrides lr0 to 0.002** — ALWAYS use `"OPTIMIZER": "AdamW"` explicitly to control LR
 2. **Fine-tuning from best.pt often fails on nano models** — the warmup phase disrupts learned features; prefer training from pretrained weights
 3. **Resolution (IMGSZ) is the #1 lever** for high-res source images — try IMGSZ=1024 early
 4. **Short training (100 epochs) can beat long training (2000 epochs)** for nano models — don't assume longer is better
 5. **Small validation sets (<200 images) cause high metric variance** — single-epoch metrics may be partly luck
-6. **LR schedule depends on epoch count** — lrf=0.002 with 2000 epochs decays too slowly; link lrf recommendation to EPOCHS setting
+6. **LR schedule depends on epoch count** — LR_FINAL=0.002 with 2000 epochs decays too slowly; link LR_FINAL recommendation to EPOCHS setting
 
 ---
 
 ## Parameter Bounds (Safety Rails)
 
-Never set parameters outside these ranges:
+The validator (`scripts/param_bounds.py`) enforces these at every round. Out-of-range values reject the round.
 
-| Parameter | Min | Max | Notes |
-|-----------|-----|-----|-------|
-| LR | 0.0001 | 0.05 | Outside → divergence or stall |
-| LR_FINAL | 0.0001 | 0.05 | Usually same as LR |
-| EPOCHS | 50 | 500 | 50–300 typical; >500 hits diminishing returns on small datasets |
-| BATCH | -1 (auto) or 2 | 64 | Auto (-1) recommended |
-| IMGSZ | 640 | 1280 | Must be multiple of 32 |
-| PATIENCE | 20 | 100 | 20–100; >100 rarely improves results on small datasets |
-| DEGREES | 0.0 | 45.0 | >45 rarely helps |
-| MOSAIC | 0.0 | 1.0 | 0 disables, 1.0 always on |
-| WEIGHT_DECAY | 0.0 | 0.005 | >0.005 too aggressive |
+| Parameter | Cold-start | Fine-tune from best.pt | Notes |
+|-----------|------------|------------------------|-------|
+| LR | 0.0001 – 0.05 | same | Outside → divergence or stall |
+| LR_FINAL | 0.0001 – 0.05 | same | Usually same as LR |
+| EPOCHS | 50 – 500 | **10** – 500 | Short fine-tunes are often optimal |
+| BATCH | -1 (auto) or 2 – 64 | same | Auto (-1) recommended |
+| IMGSZ | 640 – 1280 (×32) | same | Must be multiple of 32 |
+| PATIENCE | 20 – 100 | same | 20–100; >100 rarely improves results on small datasets |
+| DEGREES | 0.0 – 45.0 (pose: 0.0 – 15.0) | same | Pose tightened to avoid corrupting keypoints |
+| MOSAIC | 0.0 – 1.0 (classify: 0.0) | same | Disabled for classification |
+| COPY_PASTE | 0.0 – 1.0 (classify: 0.0) | same | Disabled for classification |
+| WEIGHT_DECAY | 0.0 – 0.005 | same | >0.005 too aggressive |
 
 ---
 
@@ -236,4 +374,5 @@ Never set parameters outside these ranges:
 7. **Record EVERYTHING** — future you needs exact numbers to make good decisions
 8. **Try IMGSZ=1024 at least once** if original images are high-res
 9. **Don't be afraid to switch datasets** — if primary is noisy, fallback may be better
-10. **Use OPTIMIZER="AdamW" explicitly** — never use "auto" (it overrides your LR settings)
+10. **Use `"OPTIMIZER": "AdamW"` explicitly** — never use `"auto"` (it overrides your LR settings)
+11. **Never edit `train.sh`.** All hyperparameters go through `next_params.json`. The Bash guard rejects writes to `train.sh`.

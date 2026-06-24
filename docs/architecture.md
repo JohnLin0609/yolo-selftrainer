@@ -139,22 +139,53 @@ DENY_HEADS = {
 Critical: compound commands are **split per-subcommand** before matching.
 `echo hi && rm -rf /` correctly hits `rm`, not the leading `echo`.
 
-### Boundary 2 — Param validator (top of `train.sh`)
+The guard also rejects writes to `train.sh` via any mechanism (sed -i,
+> redirect, tee, awk -i inplace, perl -i, cp/mv into the path). The
+agent's contract is to write `next_params.json`; the guard is the wall
+that backs that contract up if the prompt regresses.
 
-Hyperparameters are range-checked before YOLO launches. Out-of-range params
-abort the run, emit a `validation-failed` event, and do NOT consume a
-round — Claude wakes up, sees the abort message, can fix and retry.
+### Boundary 2 — Param contract (`next_params.json` + `apply_params.py`)
+
+The agent never edits `train.sh` directly. Each round it writes a flat
+JSON file `next_params.json` (one entry per hyperparameter). The contract
+has three layers:
+
+1. **Single source of truth** — `scripts/param_bounds.py` holds the
+   `BASE_BOUNDS` dict and `REQUIRED_KEYS` set. `bounds_for(task, fine_tune)`
+   derives per-context bounds: fine-tune from `best.pt` opens `EPOCHS` floor
+   to 10; pose tightens `DEGREES` to ≤15; classify zeros out
+   `MOSAIC`/`COPY_PASTE`. `scripts/baseline_policy.py` also reads
+   `BASE_BOUNDS` so its sampled hyperparameters fall inside by construction.
+
+2. **Primary boundary** — `scripts/apply_params.py` is the SOLE writer of
+   `effective_params.env` (the file train.sh sources). It schema-checks
+   (REQUIRED_KEYS present, unknown keys rejected as typos), range-checks
+   via `param_bounds.validate`, and on any failure emits the
+   `validation-failed` event with structured violations + writes a clear
+   "fix this" message to `next_instruction.md`. Round NOT consumed.
+
+3. **Defense-in-depth** — train.sh sources `effective_params.env`, then
+   re-calls `python3 scripts/param_bounds.py validate-env --task TASK
+   --weights "$WEIGHTS"` against the resolved env. Catches the case where
+   apply_params is bypassed (manual launch, broken script, future bug).
 
 ```python
-rng('LR',           0.0001, 0.05)
-rng('EPOCHS',       50,     500)
-rng('PATIENCE',     20,     100)
-rng('IMGSZ',        640,    1280)   # must also be multiple of 32
-rng('BATCH',        2,      64,    allow=('-1',))
-rng('MOSAIC',       0.0,    1.0)
-rng('WEIGHT_DECAY', 0.0,    0.005)
-opt in {'AdamW', 'SGD', 'auto'}
+# scripts/param_bounds.py
+BASE_BOUNDS = {
+    "LR":        {"type": "float", "min": 0.0001, "max": 0.05},
+    "EPOCHS":    {"type": "int",   "min": 50,     "max": 500},
+    "IMGSZ":     {"type": "int",   "min": 640,    "max": 1280, "multiple_of": 32},
+    "BATCH":     {"type": "int",   "min": 2,      "max": 64,   "allow": (-1,)},
+    "OPTIMIZER": {"type": "choice", "choices": ["AdamW", "SGD", "auto"]},
+    # … see source for the full table
+}
+REQUIRED_KEYS = {"WEIGHTS", "EPOCHS", "LR", "LR_FINAL",
+                 "IMGSZ", "BATCH", "OPTIMIZER", "PATIENCE"}
 ```
+
+The validation-failed event's `violations_json` carries the structured
+list `[{key, expected, got, reason}, …]` — replaying events.jsonl tells
+you exactly what the agent got wrong each time.
 
 ### Boundary 3 — Circuit breaker
 

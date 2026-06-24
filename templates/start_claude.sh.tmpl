@@ -165,18 +165,28 @@ Cold start — {{PROJECT_NAME}} — {{TASK}} task.
 IMPORTANT: The virtualenv at {{VENV_PATH}} is already activated.
 ultralytics is already installed there. Do NOT run pip install.
 
+You do NOT edit train.sh. Each round you write a flat JSON file:
+  $SCRIPT_DIR/next_params.json
+The framework reads it, validates against scripts/param_bounds.py, and
+applies the values. Out-of-range / unknown / missing-required keys → round
+rejected. See hyperparameter_strategy.md \"Parameter contract\" for keys.
+
 Do the following in order:
 1. Verify ultralytics is available:
    python -c 'import ultralytics; print(ultralytics.__version__)'
-2. Validate the dataset YAML from train.sh:
+2. Inspect the dataset YAML referenced from train.sh:
    DATASET_PATH=\$(grep '^DATASET=' $SCRIPT_DIR/train.sh | cut -d'\"' -f2)
    cat \"\$DATASET_PATH\"
    ls \$(grep '^path:' \"\$DATASET_PATH\" | awk '{print \$2}')/images/train/ | wc -l
-3. Check current train.sh params:
-   grep -E '^(WEIGHTS|EPOCHS|LR|LR_FINAL|BATCH|IMGSZ|PATIENCE|OPTIMIZER|DATASET)=' $SCRIPT_DIR/train.sh
-4. Apply hyperparameter_strategy.md to pick starting params for first run.
-   This is {{TASK}} task — model should be {{PRIMARY_MODEL}}.
-   Edit train.sh with sed as needed. Verify edits with grep.
+3. Inspect the resolved bounds for this task (read-only):
+   python3 {{ROOT_DIR}}/scripts/param_bounds.py show --task {{TASK}}
+4. Apply hyperparameter_strategy.md to pick starting params for the first run.
+   This is {{TASK}} task — WEIGHTS should be {{MODELS_DIR}}/{{PRIMARY_MODEL}}.
+   Write \$SCRIPT_DIR/next_params.json with the Write tool. Include all
+   required keys (WEIGHTS, EPOCHS, PATIENCE, LR, LR_FINAL, IMGSZ, BATCH,
+   OPTIMIZER). Sane round-1 cold-start defaults:
+     EPOCHS=100, PATIENCE=50, LR=0.01, LR_FINAL=0.01,
+     IMGSZ={{IMGSZ}}, BATCH=-1, OPTIMIZER=\"AdamW\".
 5. Launch detached:
    nohup bash $SCRIPT_DIR/train.sh > $SCRIPT_DIR/current.log 2>&1 &
    echo \$! > $SCRIPT_DIR/train.pid

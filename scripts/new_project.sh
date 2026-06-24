@@ -935,19 +935,18 @@ esac
 case "$TASK" in
     obb)
         cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
-```bash
-# Enable rotation augmentation (OBB-specific advantage)
-sed -i 's/^DEGREES=.*/DEGREES=15.0/' ./train.sh
+Set augmentation knobs directly in `next_params.json`. Required keys must
+still be present; the snippets below show only the augmentation deltas
+(merge with your base required-keys block):
 
-# Stronger rotation for more variety
-sed -i 's/^DEGREES=.*/DEGREES=30.0/' ./train.sh
+```json
+// Start: enable rotation augmentation (OBB-specific advantage)
+{ "DEGREES": 15.0, "FLIPLR": 0.5, "FLIPUD": 0.5, "CLOSE_MOSAIC": 15 }
+```
 
-# Enable flips (if defects have no preferred orientation)
-sed -i 's/^FLIPLR=.*/FLIPLR=0.5/' ./train.sh
-sed -i 's/^FLIPUD=.*/FLIPUD=0.5/' ./train.sh
-
-# Close mosaic later for cleaner convergence
-sed -i 's/^CLOSE_MOSAIC=.*/CLOSE_MOSAIC=15/' ./train.sh
+```json
+// Stronger rotation for more variety
+{ "DEGREES": 30.0, "FLIPLR": 0.5, "FLIPUD": 0.5 }
 ```
 
 **OBB augmentation notes:**
@@ -958,16 +957,10 @@ AG_EOF
         ;;
     segment)
         cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
-```bash
-# COPY_PASTE is powerful for segmentation
-sed -i 's/^COPY_PASTE=.*/COPY_PASTE=0.2/' ./train.sh
+Set augmentation knobs in `next_params.json` (merge into your base block):
 
-# Mixup for regularization
-sed -i 's/^MIXUP=.*/MIXUP=0.1/' ./train.sh
-
-# HSV for lighting variation
-sed -i 's/^HSV_H=.*/HSV_H=0.02/' ./train.sh
-sed -i 's/^HSV_S=.*/HSV_S=0.5/' ./train.sh
+```json
+{ "COPY_PASTE": 0.2, "MIXUP": 0.1, "HSV_H": 0.02, "HSV_S": 0.5 }
 ```
 
 **Segment augmentation notes:**
@@ -977,59 +970,44 @@ AG_EOF
         ;;
     pose)
         cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
-```bash
-# Be careful with DEGREES — can distort keypoint positions
-sed -i 's/^DEGREES=.*/DEGREES=10.0/' ./train.sh
+Set augmentation knobs in `next_params.json` (merge into your base block):
 
-# HSV for lighting variation
-sed -i 's/^HSV_V=.*/HSV_V=0.3/' ./train.sh
-
-# Scale variation
-sed -i 's/^SCALE=.*/SCALE=0.5/' ./train.sh
+```json
+// Pose-safe augmentation — DEGREES capped at 15 by the validator
+{ "DEGREES": 10.0, "HSV_V": 0.3, "SCALE": 0.5 }
 ```
 
 **Pose augmentation notes:**
 - Be cautious with `DEGREES` — large rotation can distort keypoint labels
-- Keep `DEGREES` ≤ 15 for pose tasks
+- The validator caps `DEGREES` at 15 for pose tasks (anything higher is rejected)
 - `SCALE` and `TRANSLATE` are safe augmentations for pose
 AG_EOF
         ;;
     classify)
         cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
-```bash
-# HSV for lighting variation
-sed -i 's/^HSV_H=.*/HSV_H=0.02/' ./train.sh
-sed -i 's/^HSV_S=.*/HSV_S=0.5/' ./train.sh
-sed -i 's/^HSV_V=.*/HSV_V=0.3/' ./train.sh
+Set augmentation knobs in `next_params.json` (merge into your base block):
 
-# Erasing for regularization
-sed -i 's/^ERASING=.*/ERASING=0.5/' ./train.sh
-
-# Mixup for regularization
-sed -i 's/^MIXUP=.*/MIXUP=0.2/' ./train.sh
+```json
+{ "HSV_H": 0.02, "HSV_S": 0.5, "HSV_V": 0.3, "ERASING": 0.5, "MIXUP": 0.2 }
 ```
 
 **Classify augmentation notes:**
 - Focus on HSV, erasing, and mixup — geometric transforms are less relevant
-- Mosaic and scale don't apply meaningfully to classification
+- `MOSAIC` and `COPY_PASTE` are force-zeroed by the validator for classify
 AG_EOF
         ;;
     *)
         cat > "$TMPDIR/augmentation_guidance.md" <<'AG_EOF'
-```bash
-# Rotation augmentation (if objects appear at varied orientations)
-sed -i 's/^DEGREES=.*/DEGREES=15.0/' ./train.sh
+Set augmentation knobs in `next_params.json` (merge into your base block):
 
-# Flips
-sed -i 's/^FLIPLR=.*/FLIPLR=0.5/' ./train.sh
-sed -i 's/^FLIPUD=.*/FLIPUD=0.5/' ./train.sh
-
-# Mosaic and mixup
-sed -i 's/^MOSAIC=.*/MOSAIC=1.0/' ./train.sh
-sed -i 's/^MIXUP=.*/MIXUP=0.1/' ./train.sh
-
-# Close mosaic later for cleaner convergence
-sed -i 's/^CLOSE_MOSAIC=.*/CLOSE_MOSAIC=15/' ./train.sh
+```json
+// General-purpose augmentation
+{
+  "DEGREES": 15.0,
+  "FLIPLR": 0.5, "FLIPUD": 0.5,
+  "MOSAIC": 1.0, "MIXUP": 0.1,
+  "CLOSE_MOSAIC": 15
+}
 ```
 AG_EOF
         ;;

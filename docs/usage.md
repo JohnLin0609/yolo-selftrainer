@@ -248,6 +248,41 @@ completed rounds are intact.
 
 ---
 
+## How the agent picks params
+
+The agent does NOT edit `train.sh`. Each round it writes a flat JSON file:
+
+```
+projects/<name>/next_params.json
+```
+
+`scripts/apply_params.py` reads it, validates against `scripts/param_bounds.py`
+(the single source of truth for bounds), and writes `effective_params.env`
+that train.sh sources before launching `yolo train`. Out-of-range / unknown /
+missing-required keys → `validation-failed` event emitted, `next_instruction.md`
+rewritten with the violations, round NOT consumed.
+
+To inspect the bounds that apply for a given task / fine-tune state:
+
+```bash
+python3 scripts/param_bounds.py show --task detect
+python3 scripts/param_bounds.py show --task detect --fine-tune
+python3 scripts/param_bounds.py show --task pose      # DEGREES capped at 15
+```
+
+Operator-side schema:
+
+| Required key | Notes |
+|---|---|
+| `WEIGHTS` | Path to `.pt`. Ending in `/best.pt` flags it as a fine-tune. |
+| `EPOCHS`, `PATIENCE`, `LR`, `LR_FINAL`, `IMGSZ`, `BATCH`, `OPTIMIZER` | See `BASE_BOUNDS` in `scripts/param_bounds.py`. |
+
+Optional augmentation keys (`MOSAIC`, `MIXUP`, `COPY_PASTE`, `ERASING`,
+`FLIPLR`, `FLIPUD`, `SCALE`, `DEGREES`, `WEIGHT_DECAY`, …) inherit their
+scaffolded value when omitted from a round.
+
+---
+
 ## Measuring agent uplift with `--mode baseline`
 
 The agent (claude or litellm) decides hyperparameters each round. But is its

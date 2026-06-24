@@ -21,6 +21,7 @@ Why the splitter is intentionally minimal:
   and warrant human review on their own.
 """
 import json
+import re
 import shlex
 import sys
 
@@ -51,6 +52,43 @@ DENY_GIT_SUBCOMMANDS = {
     "commit", "merge", "stash", "tag", "branch",
     "remote", "config", "filter-branch",
 }
+
+# The agent's hyperparameter contract is `next_params.json`. Any attempt to
+# write to train.sh (sed -i, awk -i inplace, redirect, tee) bypasses
+# apply_params.py + param_bounds.py and reopens the same trust hole the
+# structured contract closed. Read-only inspection (cat, grep, sed -n) is
+# still allowed.
+_TRAIN_SH_WRITE_PATTERNS = [
+    # `sed -i ... train.sh` (-i may carry an optional backup suffix like -i.bak)
+    re.compile(r"\bsed\b[^|;&]*\s-i(\.[A-Za-z]+)?\b[^|;&]*\btrain\.sh\b"),
+    # `awk -i inplace ... train.sh`
+    re.compile(r"\bawk\b[^|;&]*\s-i\s+inplace\b[^|;&]*\btrain\.sh\b"),
+    # `perl -i ... train.sh`
+    re.compile(r"\bperl\b[^|;&]*\s-i(\.[A-Za-z]+)?\b[^|;&]*\btrain\.sh\b"),
+    # `> train.sh` / `>> train.sh` redirect (anywhere in the subcommand)
+    re.compile(r">>?\s*([^\s|;&'\"]+/)?train\.sh\b"),
+    # `tee train.sh` / `tee -a train.sh`
+    re.compile(r"\btee\b[^|;&]*\s([^\s|;&]+/)?train\.sh\b"),
+    # `cp X train.sh` / `mv X train.sh` — already blocked by DENY_HEADS but
+    # belt-and-braces in case future relaxation enables them.
+    re.compile(r"\b(cp|mv|install)\b[^|;&]*\s([^\s|;&]+/)?train\.sh\b"),
+]
+
+
+def check_train_sh_write(subcommand: str) -> tuple[bool, str]:
+    """Return (allowed, reason). False = subcommand writes to train.sh.
+
+    Designed to be coarse: a few false positives are acceptable since the
+    agent has next_params.json as the supported channel. The matched
+    pattern is included in the reason so the agent can re-plan.
+    """
+    for pat in _TRAIN_SH_WRITE_PATTERNS:
+        if pat.search(subcommand):
+            return False, (
+                f"writes to train.sh are blocked — set hyperparameters via "
+                f"next_params.json instead (matched: {pat.pattern!r})"
+            )
+    return True, ""
 
 
 def split_subcommands(command: str):
@@ -112,6 +150,12 @@ def head_token(subcommand: str) -> tuple[str, list[str]]:
 def check_command(command: str) -> tuple[bool, str]:
     """Return (allowed, reason). reason is empty when allowed."""
     for sub in split_subcommands(command):
+        # Check the train.sh-write patterns BEFORE the head-token deny list.
+        # This catches `bash -c "sed -i ... train.sh"`-style wrappers where
+        # the head token is something benign.
+        ok, reason = check_train_sh_write(sub)
+        if not ok:
+            return False, f"{reason} (subcommand: {sub!r})"
         head, tokens = head_token(sub)
         if not head:
             continue

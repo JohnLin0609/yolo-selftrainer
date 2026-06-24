@@ -67,10 +67,11 @@ TOOL_DEFINITIONS = [
                 "Execute a shell command in the project directory. "
                 "Use for file inspection (ls, cat, grep, head, tail, awk), "
                 "training launches (nohup bash train.sh > current.log 2>&1 &), "
-                "parameter edits (sed -i), process checks (kill -0 PID). "
+                "process checks (kill -0 PID). "
+                "Hyperparameters are set via next_params.json (use the Write "
+                "tool) — sed-editing train.sh is rejected by the safety guard. "
                 "Dangerous commands (rm, pip install, sudo, mv, git push, ...) are "
-                "blocked by a deterministic safety guard regardless of the "
-                "permission model."
+                "blocked by the same guard regardless of the permission model."
             ),
             "parameters": {
                 "type": "object",
@@ -87,9 +88,10 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": TOOL_WRITE,
             "description": (
-                "Create or overwrite a file. Primary use: writing "
-                "next_instruction.md with the structured sections described "
-                "in the system prompt before exiting the round."
+                "Create or overwrite a file. Primary uses: writing "
+                "next_params.json (the hyperparameter contract for the next "
+                "round) and writing next_instruction.md with the structured "
+                "sections described in the system prompt before exiting."
             ),
             "parameters": {
                 "type": "object",
@@ -126,8 +128,9 @@ PROVIDER_TOOL_NUDGE: dict[str, str] = {
     "openai":    "",
     "gemini": (
         "\n\nIMPORTANT: You have tools (Bash, Write, Read). You MUST use them "
-        "to inspect files, edit train.sh, and write next_instruction.md. Do "
-        "NOT just describe what you would do — actually call the tools."
+        "to inspect files, write next_params.json (the hyperparameter contract), "
+        "and write next_instruction.md. Do NOT just describe what you would do "
+        "— actually call the tools. Never edit train.sh."
     ),
     "ollama": (
         "\n\nIMPORTANT: You have three tools — Bash, Write, Read. Every "
