@@ -141,9 +141,10 @@ BYPASS_ATTEMPTS = [
     "xargs -I{} sh -c 'rm {}' < list.txt",
     "echo /tmp/x | xargs rm",
 
-    # Command substitution at the head position — the actual head is
+    # Command substitution AT THE HEAD POSITION — the actual head is
     # produced by an inner command and the outer guard never sees it.
-    'echo $(printf "rm -rf /tmp/x")',
+    # Mid-args substitution like `kill -0 $(cat train.pid)` stays allowed.
+    "$(echo rm) /tmp/x",
     "$(echo rm) -rf /tmp/x",
     "`echo rm` -rf /tmp/x",
 
@@ -153,16 +154,18 @@ BYPASS_ATTEMPTS = [
 ]
 
 
-@pytest.mark.bypass_pending
 @pytest.mark.parametrize("cmd", BYPASS_ATTEMPTS, ids=lambda c: c[:55])
 def test_bypass_attempts_blocked(cmd):
-    """These currently FAIL (guard allows). xfail'd via conftest collection
-    hook; the implementation PR that hardens the predicate removes the
-    marker and these flip to plain passing tests."""
+    """All BYPASS_ATTEMPTS must be rejected by the hardened predicate
+    (`_BYPASS_PATTERNS` in scripts/claude_bash_guard.py). If a regression
+    weakens those patterns, this test fails loudly. New known-but-unfixed
+    bypasses can be added back to BYPASS_ATTEMPTS with the
+    `@pytest.mark.bypass_pending` marker — conftest auto-xfails any
+    so-marked test until the predicate catches them."""
     ok, reason = cbg.check_command(cmd)
     assert ok is False, (
-        f"BYPASS: guard allows {cmd!r} — "
-        f"approach 2 (allow-list) or approach 1 (sandbox) should block it"
+        f"BYPASS regression: guard allows {cmd!r} — "
+        f"_BYPASS_PATTERNS should catch this"
     )
     assert reason, "blocked commands must carry a non-empty reason"
 

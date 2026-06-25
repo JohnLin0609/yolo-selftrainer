@@ -34,38 +34,33 @@ tests/
 
 ## Conventions
 
-### xfail on the bypass scenarios
+### bypass_pending marker (for newly-discovered bypasses)
 
-Today's Bash guard (`scripts/claude_bash_guard.py`) is a denylist of
-command **heads**. Several straightforward bypasses (`python3 -c`,
-`bash -c`, `find -delete`, heredocs, command substitution) slip through.
-The tests/feature scenarios that exercise these bypasses are marked
-`xfail` via `conftest.py::pytest_collection_modifyitems` keyed on the
-filename `bypass_attempts.feature` plus a separate per-test marker for
-the matching unit tests.
+The predicate (`scripts/claude_bash_guard.py::_BYPASS_PATTERNS`) is
+hardened: bypass tests in `test_bypass_attempts_blocked` and the
+scenarios in `bypass_attempts.feature` pass cleanly on `main`. If you
+discover a NEW bypass that the predicate doesn't yet catch, add it to
+`BYPASS_ATTEMPTS` with `@pytest.mark.bypass_pending` — `conftest.py`
+auto-xfails any test carrying that marker, so the suite stays green
+while you (or a follow-up PR) extend `_BYPASS_PATTERNS` to handle it.
 
-When the predicate is hardened (allow-list or sandbox-residual), those
-tests **XPASS**. The implementation PR strips the xfail marker in
-`conftest.py` in the same diff that adds the predicate logic.
-
-`strict=False` is deliberate — strict-xfail would FAIL on XPASS, which
-defeats the "tests turn green when impl lands" workflow. The trade-off:
-an XPASS goes silently green; the impl PR's reviewer is responsible for
-removing the marker.
+`strict=False` on the marker so once the predicate catches it, the test
+silently flips from XFAIL to XPASS; the PR that hardens the pattern is
+responsible for removing the `bypass_pending` marker from the test row.
 
 ### skipif on sandbox scenarios
 
-`tests/features/sandbox_isolation.feature` describes the contract the
-**future** sandbox runtime must satisfy: command writes don't escape
-the project; network is denied; sibling projects unreadable. The
-runtime doesn't exist yet, so `conftest.py` auto-skips every scenario
-in that feature file unless `scripts/sandbox.run_in_sandbox` is
-importable. Once the implementation PR adds `scripts/sandbox.py`, the
-scenarios run automatically — no test-file changes needed.
+`tests/features/sandbox_isolation.feature` exercises the bwrap-based
+sandbox runtime in `scripts/sandbox.py`. On hosts WITH `bubblewrap`
+(`apt install bubblewrap`) the scenarios run and assert OS-level
+isolation: command writes can't escape the project, sibling projects
+are unreadable, network is denied. On hosts without `bwrap` they skip
+gracefully — `conftest.py::_sandbox_available()` checks both that the
+module imports AND that `sandbox.is_available()` returns True.
 
-`tests/steps/sandbox_isolation_steps.py` uses **lazy imports** inside
+`tests/steps/test_sandbox_isolation.py` uses **lazy imports** inside
 each step function so pytest-bdd can collect the file even when the
-module is absent. Module-level imports would crash collection.
+module / runtime is absent. Module-level imports would crash collection.
 
 ### Why both unit tests and BDD scenarios
 
@@ -78,23 +73,18 @@ They lock the same contract from two angles:
   Catches integration-level regressions (e.g., a refactor that breaks
   the JSON-input parser without changing `check_command`).
 
-When the allow-list implementation lands, both sets un-xfail in lockstep
-(the impl PR diff touches one conftest.py marker block).
-
-## Running just the failing-on-main contract
-
-```bash
-# See exactly which gaps the current guard has:
-.venv/bin/pytest tests/ -v -m "" --runxfail
-```
-
-`--runxfail` disables the xfail decorator, so the bypass tests fail
-loudly. Useful for confirming "these are the bypasses we know about" in
-a security review.
+The sandbox feature is BDD-only — it exercises the OS-level isolation
+contract end-to-end (real bwrap, real mount layout, real subprocesses).
+Unit-testing the bwrap argv builder directly would only re-test what
+bwrap itself already enforces.
 
 ## Exit-code contract
 
-`.venv/bin/pytest tests/ -q` must return exit code **0** on `main`. The
-xfail + skipped counters appear in the summary line; neither counts as
-failure. This keeps CI green while the contract is documented but
-unimplemented.
+`.venv/bin/pytest tests/ -q` must return exit code **0** on `main`. On a
+host with `bubblewrap` installed the expected summary is `103 passed`;
+without bwrap the 7 sandbox-isolation scenarios skip, summary `96
+passed, 7 skipped`. Either way, exit 0.
+
+If a `bypass_pending`-marked test ever appears (a newly-discovered
+bypass), the summary will also include an `xfailed` count — still
+exit 0.

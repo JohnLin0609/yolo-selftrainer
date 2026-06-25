@@ -214,6 +214,28 @@ def guard_bash_command(guard_script: Path | None, command: str) -> tuple[bool, s
     return False, (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
 
 
+# Sandbox availability is cached at import time — checked once per agent
+# session, not per command. Falls cleanly back to host execution (with a
+# loud warning) when bwrap isn't installed.
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import sandbox as _sandbox  # type: ignore[import-not-found]
+    _SANDBOX_OK = _sandbox.is_available()
+except Exception:
+    _sandbox = None  # type: ignore[assignment]
+    _SANDBOX_OK = False
+
+# One-time stderr advisory so operators know which mode they're in.
+if _SANDBOX_OK:
+    print("[run_agent] Bash dispatch will route through scripts/sandbox.py (bwrap)", file=sys.stderr)
+else:
+    print(
+        "[run_agent] WARN: sandbox runtime unavailable — Bash runs directly on the host. "
+        "Install `bubblewrap` to enable OS-level isolation for the agent's Bash tool.",
+        file=sys.stderr,
+    )
+
+
 def run_bash(command: str, *, guard_script: Path | None, timeout: int, max_chars: int) -> str:
     ok, reason = guard_bash_command(guard_script, command)
     if not ok:
@@ -224,14 +246,25 @@ def run_bash(command: str, *, guard_script: Path | None, timeout: int, max_chars
             "scripts/claude_bash_guard.py to allow it. Otherwise plan a different approach."
         )
     try:
-        proc = subprocess.run(
-            command,
-            shell=True,
-            executable="/bin/bash",
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        if _SANDBOX_OK and _sandbox is not None:
+            # cwd at agent launch is the project dir (start_agent.sh execs
+            # from $SCRIPT_DIR). Framework root is two levels up from this
+            # source file (scripts/run_agent.py → repo root).
+            proc = _sandbox.run_in_sandbox(
+                project_dir=Path.cwd(),
+                command=command,
+                framework_root=Path(__file__).resolve().parent.parent,
+                timeout=timeout,
+            )
+        else:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
     except subprocess.TimeoutExpired:
         return f"ERROR: command timed out after {timeout}s\nCommand: {command!r}"
     except Exception as e:

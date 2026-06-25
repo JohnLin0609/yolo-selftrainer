@@ -116,15 +116,21 @@ an explicit `[... N chars omitted ...]` marker so the model knows.
 
 ## Trust boundaries
 
-The framework runs an LLM unattended. Boundaries 2 and 3 below are
-**deterministic gates** — they hard-fail any input outside their
-contract. **Boundary 1 (the Bash guard) is best-effort today** — a
-denylist of command heads plus train.sh-write regexes. It catches the
-obvious dangerous commands (`rm`, `sudo`, `pip`, …) but has known
-bypasses; do not treat it as the sole protection for sensitive paths.
-The canonical contract for the hardened guard lives in
-`tests/features/bypass_attempts.feature` and
-`tests/features/sandbox_isolation.feature`.
+The framework runs an LLM unattended. Three boundaries protect it:
+
+- **Boundary 1 (Bash guard)** has TWO layers — a hardened predicate in
+  `scripts/claude_bash_guard.py` (denylist + bypass-pattern rejection +
+  train.sh-write regex) that runs in both claude CLI mode and run_agent.py
+  mode, plus an OS-level `bwrap` sandbox in `scripts/sandbox.py` that
+  wraps Bash execution **only in run_agent.py mode**. In claude CLI mode
+  the sandbox does not apply (claude controls its own Bash dispatch);
+  the predicate is the sole protection there.
+- **Boundaries 2 and 3** are deterministic gates — they hard-fail any
+  input outside their contract.
+
+The canonical contract for both Boundary 1 layers lives in
+`tests/features/bypass_attempts.feature` (predicate) and
+`tests/features/sandbox_isolation.feature` (sandbox runtime).
 
 ### Boundary 1 — Bash guard (`scripts/claude_bash_guard.py`)
 
@@ -152,39 +158,65 @@ The guard also rejects writes to `train.sh` via any mechanism (sed -i,
 agent's contract is to write `next_params.json`; the guard is the wall
 that backs that contract up if the prompt regresses.
 
-#### Known gaps (Boundary 1 is denylist-based)
+#### Bypass-pattern rejection (the predicate's second layer)
 
-The current head-token denylist is bypassable. Any of the following
-are **allowed** today and would let the agent reach arbitrary commands:
+The original head-token denylist could be bypassed by wrapping the
+dangerous command in an interpreter, a find primitive, or command
+substitution. `_BYPASS_PATTERNS` in `claude_bash_guard.py` now rejects
+all of those at the same trust boundary:
 
-- **Interpreter wrappers** — the head token is `python3` / `bash` / `sh` /
-  `eval`, not on the deny list, but the payload is arbitrary:
-  - `python3 -c "import os; os.remove('/x')"`
-  - `bash -c 'rm /x'`, `sh -c '...'`, `eval 'rm /x'`
-- **find primitives** — head is `find`, payload erases without invoking `rm`:
-  - `find . -delete`, `find / -exec rm {} \;`
-- **Embedded interpreters** in otherwise-benign tools:
-  - `awk 'BEGIN{system("rm /x")}' /dev/null`, `perl -e 'unlink "/x"'`
-- **xargs feeding a wrapper** — dangerous tail buried in argv:
-  - `xargs -I{} sh -c 'rm {}' < list.txt`
-- **Command substitution at the head position** — the outer guard sees
-  the substitution syntax, not the resolved command:
-  - `$(echo rm) -rf /x`, `` `echo rm` -rf /x ``
-- **Heredocs feeding an interpreter** — equivalent to `bash -c`:
-  - `bash <<'EOF'\nrm /x\nEOF`
+```python
+_BYPASS_PATTERNS = [
+    (re.compile(r"\b(?:/[^/\s]+/)*(?:bash|sh|dash|zsh|python3?|node|ruby|perl)\b[^|;&]*\s(?:-[a-zA-Z]*c|--command)\b"),
+     "interpreter -c: arbitrary code execution"),
+    (re.compile(r"(?<![\w/.-])eval\b"), "eval: arbitrary code execution"),
+    (re.compile(r"\bfind\b[^|;&]*\s-delete\b"),
+     "find -delete: erases without invoking rm"),
+    (re.compile(r"\bfind\b[^|;&]*\s-(?:exec|execdir|ok|okdir)\b"),
+     "find -exec/-execdir/-ok: arbitrary command spawn"),
+    (re.compile(r"\bawk\b[^|;&]*['\"][^'\"]*\bsystem\s*\("),
+     "awk system(): arbitrary command spawn"),
+    # … perl -e, xargs sh, heredoc-to-interpreter, $(...) at head, backtick at head
+]
+```
 
-These cases are documented as `xfail` tests in
-`tests/unit/test_claude_bash_guard.py::test_bypass_attempts_blocked` and
-as scenarios in `tests/features/bypass_attempts.feature`. The xfail
-markers flip to passing tests when the predicate is hardened
-(approach 2 — allow-list) or when the agent's Bash runs inside an OS
-sandbox (approach 1 — container/namespace isolation). The contract
-for approach 1 lives in `tests/features/sandbox_isolation.feature`
-(SKIPPED today; auto-runs once `scripts/sandbox.run_in_sandbox` exists).
+The check runs between the train.sh-write regex and the head-token deny
+check; it's a third filter, not a replacement for the other two. Tests
+locking the contract: `tests/unit/test_claude_bash_guard.py::test_bypass_attempts_blocked` (19 cases) and `tests/features/bypass_attempts.feature` (9 scenarios). All pass on `main` as of the hardening PR.
 
-Operational implication: **do not rely on Boundary 1 alone** for
-protecting host paths outside the project tree. Boundaries 2 and 3
-remain deterministic; Boundary 1 is a partial wall.
+One deliberate exception: **mid-args command substitution is allowed**
+(`kill -0 $(cat train.pid)` is a legitimate idiom the agent uses every
+round). Only **head-position** substitution (the command itself comes
+from a substitution) is rejected. Tests cover both directions.
+
+#### Sandbox runtime (`scripts/sandbox.py`, run_agent.py mode only)
+
+`scripts/sandbox.py` wraps Bash execution in `bubblewrap` (`bwrap`):
+
+- Root mounted **read-only**; `{framework_root}` mounted read-only.
+- `{project_dir}` is the ONLY writable real path.
+- `/tmp` is a tmpfs — escape attempts (`echo poison > /tmp/marker`) do
+  not touch the host.
+- `--unshare-net` — no network from in-sandbox commands.
+- `--unshare-pid` — own pid namespace (can't kill host processes).
+- `--die-with-parent` — sandbox dies if the python parent dies.
+
+`scripts/run_agent.py`'s `run_bash` routes through
+`sandbox.run_in_sandbox(...)` when `sandbox.is_available()` returns True
+(bwrap on PATH). When unavailable, it logs to stderr and falls back to
+host execution — the predicate alone still protects, but operators
+get a loud warning at agent startup.
+
+**Asymmetry**: in claude CLI mode the sandbox is NOT wired in — claude
+runs Bash itself; the PreToolUse hook can only validate, not relocate
+execution. Hardening claude CLI mode further would require launching
+claude itself inside bwrap; that's a separate piece of work.
+
+Contract tests for the sandbox: `tests/features/sandbox_isolation.feature`
+covers cannot-delete-sibling, cannot-write-outside, cannot-read-sibling,
+writes-within-project-succeed, framework-read-only, network-denied.
+All scenarios pass on bwrap-capable hosts; they skip gracefully when
+bwrap is absent.
 
 ### Boundary 2 — Param contract (`next_params.json` + `apply_params.py`)
 

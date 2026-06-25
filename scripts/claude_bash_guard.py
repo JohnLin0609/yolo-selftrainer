@@ -91,6 +91,65 @@ def check_train_sh_write(subcommand: str) -> tuple[bool, str]:
     return True, ""
 
 
+# Known bypass patterns for the head-token denylist. Each entry is
+# (compiled_regex, human-readable reason). The patterns are tight enough
+# to avoid false positives on legitimate idioms (read-only sed/awk, python3
+# with a script arg, mid-args $(...) like `kill -0 $(cat train.pid)`).
+#
+# Defense-in-depth alongside Boundary 2 (param contract) and Boundary 3
+# (circuit breaker). In run_agent.py mode the sandbox runtime adds OS-level
+# isolation as well — see scripts/sandbox.py and docs/architecture.md.
+_BYPASS_PATTERNS = [
+    # -c / --command on any interpreter: payload is arbitrary code.
+    # The interpreter token may carry a /path/to/ prefix (/bin/bash etc.).
+    (re.compile(r"\b(?:/[^/\s]+/)*(?:bash|sh|dash|zsh|python3?|node|ruby|perl)\b[^|;&]*\s(?:-[a-zA-Z]*c|--command)\b"),
+     "interpreter -c: arbitrary code execution"),
+    # eval at word boundary
+    (re.compile(r"(?<![\w/.-])eval\b"),
+     "eval: arbitrary code execution"),
+    # find primitives that delete or spawn commands
+    (re.compile(r"\bfind\b[^|;&]*\s-delete\b"),
+     "find -delete: erases without invoking rm"),
+    (re.compile(r"\bfind\b[^|;&]*\s-(?:exec|execdir|ok|okdir)\b"),
+     "find -exec/-execdir/-ok: arbitrary command spawn"),
+    # awk / perl embedded shell
+    (re.compile(r"\bawk\b[^|;&]*['\"][^'\"]*\bsystem\s*\("),
+     "awk system(): arbitrary command spawn"),
+    (re.compile(r"\bperl\b[^|;&]*\s-[a-zA-Z]*e\b"),
+     "perl -e: arbitrary code execution"),
+    # xargs feeding a wrapper interpreter
+    (re.compile(r"\bxargs\b[^|;&]*\s-[Ii]\b[^|;&]*\s(?:bash|sh|python3?|dash|zsh)\b"),
+     "xargs -I … sh|bash|python: arbitrary command spawn"),
+    # xargs piped to a deny-listed command — the bypass is the wrapper, not
+    # xargs itself
+    (re.compile(r"\bxargs\b\s+(?:-[a-zA-Z0-9]+(?:=\S+)?\s+)*(?:rm|rmdir|sudo|mv|cp|chmod|chown|dd|kill)\b"),
+     "xargs to a deny-listed command"),
+    # Heredoc redirected INTO an interpreter (bash <<EOF, python3 <<'EOF', …).
+    # The heredoc body is arbitrary code the interpreter will run.
+    (re.compile(r"\b(?:bash|sh|dash|zsh|python3?|perl|ruby|node)\b[^|;&]*\s<<-?\s*['\"]?\w+"),
+     "heredoc into interpreter: arbitrary code execution"),
+    # Command substitution AT THE HEAD POSITION (start of subcommand, after
+    # optional env-var assignments + whitespace). Substitution mid-args is
+    # allowed — `kill -0 $(cat train.pid)` is a legitimate idiom.
+    (re.compile(r"^\s*(?:[A-Z_][A-Z0-9_]*=\S*\s+)*\$\("),
+     "command substitution at head: actual command obscured from validator"),
+    (re.compile(r"^\s*(?:[A-Z_][A-Z0-9_]*=\S*\s+)*`"),
+     "backtick command substitution at head: actual command obscured"),
+]
+
+
+def check_bypass_patterns(subcommand: str) -> tuple[bool, str]:
+    """Return (allowed, reason). False = subcommand matches a known bypass.
+
+    Runs between check_train_sh_write and the head-token deny check, so
+    rejections here surface BEFORE the head-token gets to decide.
+    """
+    for pat, reason in _BYPASS_PATTERNS:
+        if pat.search(subcommand):
+            return False, reason
+    return True, ""
+
+
 def split_subcommands(command: str):
     """Split on logical operators while respecting single + double quotes."""
     parts: list[str] = []
@@ -154,6 +213,13 @@ def check_command(command: str) -> tuple[bool, str]:
         # This catches `bash -c "sed -i ... train.sh"`-style wrappers where
         # the head token is something benign.
         ok, reason = check_train_sh_write(sub)
+        if not ok:
+            return False, f"{reason} (subcommand: {sub!r})"
+        # Bypass patterns: interpreter -c, eval, find -delete, awk system(),
+        # heredoc-to-interpreter, head-position substitution, etc. Runs
+        # AFTER train-sh-write but BEFORE the head-token deny so a wrapper
+        # like `bash -c rm /x` is rejected at this layer, not the next.
+        ok, reason = check_bypass_patterns(sub)
         if not ok:
             return False, f"{reason} (subcommand: {sub!r})"
         head, tokens = head_token(sub)

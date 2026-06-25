@@ -72,12 +72,11 @@ def bash_guard(guard_path):
 # ─── Sandbox runtime presence (controls skipif on sandbox scenarios) ──
 
 def _sandbox_available() -> bool:
-    """Returns True once scripts/sandbox is importable.
-
-    The implementation PR that lands the sandbox runtime creates
-    `scripts/sandbox.py` (or a package) with a callable named
-    `run_in_sandbox`. Until then this returns False and the sandbox
-    BDD feature is skipped.
+    """Returns True iff the sandbox module imports AND a backend runtime
+    (currently `bwrap`) is on PATH. Both checks matter: a contributor
+    might delete `scripts/sandbox.py`, or run the suite on a host without
+    bubblewrap installed (e.g., CI containers, macOS dev machines). In
+    either case the sandbox BDD scenarios skip gracefully.
     """
     spec = importlib.util.find_spec("sandbox")
     if spec is None:
@@ -86,7 +85,16 @@ def _sandbox_available() -> bool:
         mod = importlib.import_module("sandbox")
     except Exception:
         return False
-    return hasattr(mod, "run_in_sandbox")
+    if not hasattr(mod, "run_in_sandbox"):
+        return False
+    is_available = getattr(mod, "is_available", None)
+    if callable(is_available):
+        try:
+            return bool(is_available())
+        except Exception:
+            return False
+    # Module exists, no is_available helper — assume capable.
+    return True
 
 
 SANDBOX_AVAILABLE = _sandbox_available()
@@ -96,9 +104,7 @@ SANDBOX_AVAILABLE = _sandbox_available()
 
 # pytest-bdd generates test functions inside the `test_*.py` step file,
 # so the nodeid path carries the .py filename (NOT the .feature). Match
-# on both for robustness — manual unit-test runners may use the .feature
-# extension; pytest-bdd-generated ones use the .py extension.
-_BYPASS_MARKERS = ("bypass_attempts.feature", "test_bypass_attempts.py")
+# on both for robustness.
 _SANDBOX_MARKERS = ("sandbox_isolation.feature", "test_sandbox_isolation.py")
 
 
@@ -110,36 +116,31 @@ def pytest_collection_modifyitems(config, items):
       generator to add markers is verbose. A collection hook is cleaner
       and the convention lives in ONE place future contributors can find.
     """
-    bypass_xfail = pytest.mark.xfail(
-        reason=(
-            "Boundary 1 hardening pending — see "
-            "tests/README.md \"Conventions\". Removed when the predicate "
-            "is hardened (approach 2 allow-list) or sandbox lands "
-            "(approach 1)."
-        ),
-        strict=False,
-    )
+    # The Boundary 1 predicate is hardened (commit-followup to dc0854d): the
+    # bypass-rejection patterns + bwrap sandbox runtime are both shipped.
+    # Bypass tests now PASS on their own; no auto-xfail marker is applied.
+    # Sandbox tests still skip when bwrap (or scripts/sandbox.py) is missing,
+    # so the suite stays green on hosts without the runtime.
     sandbox_skip = pytest.mark.skipif(
         not SANDBOX_AVAILABLE,
         reason=(
-            "scripts/sandbox runtime not present — sandbox isolation "
-            "scenarios document the contract for the next PR. They "
-            "auto-run once scripts/sandbox.run_in_sandbox is importable."
+            "sandbox runtime unavailable — install `bubblewrap` (bwrap) and "
+            "ensure scripts/sandbox.py is importable. The sandbox-isolation "
+            "scenarios document the OS-level contract; on a capable host "
+            "they run automatically."
         ),
     )
     for item in items:
         nodeid = item.nodeid
-        # Only xfail the "this command must be rejected" scenarios — the
-        # "must still be allowed" scenarios in the same file are NOT
-        # bypasses and should pass cleanly today. Convention: bypass
-        # scenarios start their name with "rejects_" (Gherkin
-        # "Scenario: rejects …" → pytest "test_rejects_…").
-        is_bypass_scenario = (
-            any(m in nodeid for m in _BYPASS_MARKERS)
-            and "test_rejects_" in nodeid
-        )
-        if is_bypass_scenario or item.get_closest_marker("bypass_pending"):
-            item.add_marker(bypass_xfail)
+        # The bypass_pending marker is still recognized so a future
+        # contributor can mark a newly-discovered bypass as expected-fail
+        # without scattering inline xfail decorators. When the marker is
+        # present we still auto-xfail; otherwise nothing happens.
+        if item.get_closest_marker("bypass_pending"):
+            item.add_marker(pytest.mark.xfail(
+                reason="bypass marked pending — see tests/README.md",
+                strict=False,
+            ))
         if any(m in nodeid for m in _SANDBOX_MARKERS):
             item.add_marker(sandbox_skip)
 
