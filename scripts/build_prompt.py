@@ -44,6 +44,11 @@ from pathlib import Path
 RECENT_RUNS_FULL = 3  # most recent N runs get full detail in the history section
 MAX_PROSE_CHARS = int(os.environ.get("YOLO_TRAINER_PROSE_BUDGET", "12000"))
 
+# Persistence window for per-class weakness detection. A class flagged as the
+# worst class for `PERSIST_N` consecutive rounds (this round inclusive) gets
+# the "Persistent weakness detected" callout in the prompt.
+PERSIST_N = int(os.environ.get("YOLO_TRAINER_PERSIST_N", "3"))
+
 
 # ─── FIREWALL: operator-only event types ────────────────────────────────
 # These event types carry data the agent must NEVER see. Held-out test
@@ -313,6 +318,133 @@ def build_metrics_table_section(events: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _per_class_events(events: list[dict]) -> list[dict]:
+    """All per_class_metrics events in chronological order."""
+    return sorted(
+        (e for e in events if e.get("type") == "per_class_metrics"),
+        key=lambda e: e.get("ts", ""),
+    )
+
+
+def _light_history_for_diagnose(prior_events: list[dict], metric: str) -> list[dict]:
+    """Convert prior per_class_metrics events to the lightweight history
+    shape `diagnose_weak_classes` expects (a list of past Diagnosis dicts).
+
+    We only need each prior round's `worst[0].class` for the persistence
+    test, so we don't re-run the full diagnose; we just compute the rank-1
+    class. This keeps build_prompt fast even when events.jsonl has many
+    rounds of per-class data.
+    """
+    history: list[dict] = []
+    for ev in prior_events:
+        pc = ev.get("per_class") or {}
+        if not pc:
+            history.append({"worst": []})
+            continue
+        ranked = sorted(
+            pc.items(),
+            key=lambda kv: (
+                float((kv[1] or {}).get(metric, 0.0) or 0.0),
+                int((kv[1] or {}).get("support", 0) or 0),
+                kv[0],
+            ),
+        )
+        history.append({"worst": [{"class": ranked[0][0]}]})
+    return history
+
+
+def build_per_class_section(events: list[dict]) -> str | None:
+    """Render the per-class weakness block, or None if no data yet.
+
+    Sources its data from the latest `per_class_metrics` event and the
+    diagnose_weak_classes pure function. When the diagnosis flags any
+    class as `persistent`, the section prepends a high-visibility callout
+    telling the agent to write a `## Data-layer recommendations` block in
+    next_instruction.md — and reminds it that the Bash guard rejects any
+    write under `datasets/`.
+    """
+    # Import here, not at module top, so `import build_prompt` keeps working
+    # in environments where diagnose_classes is somehow absent (defensive —
+    # the file is shipped alongside this one).
+    try:
+        from diagnose_classes import diagnose_weak_classes
+    except ImportError:
+        return None
+
+    series = _per_class_events(events)
+    if not series:
+        return None
+
+    latest = series[-1]
+    prior = series[:-1]
+    per_class = latest.get("per_class") or {}
+    confusion = latest.get("confusion") or []
+    class_names = latest.get("class_names") or []
+    if not per_class:
+        return None
+
+    metric = "mAP50"
+    history = _light_history_for_diagnose(prior, metric=metric)
+    d = diagnose_weak_classes(
+        per_class, confusion, class_names,
+        history=history,
+        persistent_n=PERSIST_N,
+        metric=metric,
+    )
+
+    lines = ["## Per-class diagnosis (from latest run's per_class_metrics event)"]
+    lines.append("> Machine-extracted from `model.val()` on the run's `weights/best.pt`.")
+    lines.append("> See `runs/<task>/<run_name>/confusion_matrix.png` for the full matrix.")
+    lines.append("")
+    lines.append(f"- Run: `{latest.get('run_name', '?')}` (round {latest.get('round', '?')})")
+    lines.append(f"- Ranking metric: **{metric}** (lower = worse)")
+    lines.append("")
+    lines.append("### Worst classes")
+    if d["worst"]:
+        lines.append("| Rank | Class | mAP50 | support | persistent |")
+        lines.append("|---|---|---|---|---|")
+        for i, w in enumerate(d["worst"], 1):
+            mark = "**yes**" if w.get("persistent") else "no"
+            lines.append(
+                f"| {i} | `{w['class']}` | {fmt_metric(w['score'])} "
+                f"| {w['support']} | {mark} |"
+            )
+    else:
+        lines.append("(none)")
+    lines.append("")
+    lines.append("### Most-confused pairs (true → predicted)")
+    if d["confused_pairs"]:
+        for p in d["confused_pairs"]:
+            lines.append(f"- `{p['a']}` → `{p['b']}`: {p['count']} mispredictions")
+    else:
+        lines.append("(no off-diagonal entries above the per-row noise floor)")
+
+    if d["recommend_data_review"]:
+        flagged = ", ".join(f"`{c}`" for c in d["recommend_data_review"])
+        lines.append("")
+        lines.append("### ⚠️ Persistent weakness detected")
+        lines.append(
+            f"> Class(es) flagged: {flagged} — worst for {PERSIST_N} consecutive rounds. "
+            "The data layer is the likely root cause."
+        )
+        lines.append("")
+        lines.append(
+            "Write a `## Data-layer recommendations` block in next_instruction.md "
+            "enumerating one or more of:"
+        )
+        lines.append("- **Suspected labeling noise** (audit annotations for this class)")
+        lines.append("- **Insufficient samples** (collect more training examples for this class)")
+        lines.append("- **Augmentation mismatch** (review aug parameters for this class type)")
+        lines.append("")
+        lines.append(
+            "**DO NOT modify the `datasets/` directory directly** — the Bash guard "
+            "rejects writes under `datasets/`. All data work is human-mediated; the "
+            "agent's role is to surface the recommendation, not to act on it."
+        )
+
+    return "\n".join(lines)
+
+
 def build_history_section(events: list[dict]) -> str:
     runs = runs_in_order(events)
     if not runs:
@@ -421,6 +553,9 @@ def main() -> int:
 
     if has_runs:
         sections.append(build_facts_section(events))
+        per_class_section = build_per_class_section(events)
+        if per_class_section:
+            sections.append(per_class_section)
         sections.append(build_metrics_table_section(events))
         sections.append(build_history_section(events))
     else:

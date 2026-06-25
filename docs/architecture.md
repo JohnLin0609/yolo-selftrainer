@@ -158,6 +158,14 @@ The guard also rejects writes to `train.sh` via any mechanism (sed -i,
 agent's contract is to write `next_params.json`; the guard is the wall
 that backs that contract up if the prompt regresses.
 
+The same shape of rule applies to **`datasets/`** (`_DATASETS_WRITE_PATTERNS`):
+the dataset is operator-curated, and the per-class diagnostics feature
+(Boundary 4 below) deliberately routes data-layer findings into
+recommendations the agent *writes about*, never into actions the agent
+*takes*. Read-only inspection (`cat`, `find -print`, `grep`, `sed -n`,
+`awk` without `-i inplace`) stays allowed — the agent still needs to
+inspect dataset YAMLs to reason about class names and sample counts.
+
 #### Bypass-pattern rejection (the predicate's second layer)
 
 The original head-token denylist could be bypassed by wrapping the
@@ -309,6 +317,49 @@ How the firewall is enforced:
 4. `scripts/generate_report.py` reads `test_metrics` events (operator
    tool — not agent-facing) and renders side-by-side val/test columns
    plus a divergence-trend insight, so val-overfitting jumps out.
+
+#### Per-class diagnostics (agent-visible, dataset-read-only)
+
+Per-class P/R/mAP and the confusion matrix are surfaced to the agent —
+they're *necessary* for the agent to reason about which class is
+dragging down the metric. The asymmetry vs the held-out test split:
+per-class data IS visible (so the agent can act on it), but the action
+is restricted to writing a **read-only recommendation**, never to
+mutating the dataset.
+
+How it's enforced:
+
+1. `scripts/per_class_metrics.py` runs `model.val()` on `best.pt` after
+   each successful training round, emits a `per-class-metrics` event
+   carrying per-class metrics + the confusion matrix.
+
+2. `scripts/diagnose_classes.py` is a pure function that ranks weak
+   classes (ascending by mAP50, tie-broken by support then alphabetic)
+   and flags `persistent` when the same class has been worst for N
+   consecutive rounds (default N=3, override `YOLO_TRAINER_PERSIST_N`).
+
+3. `scripts/build_prompt.py:build_per_class_section` surfaces the
+   ranking + top-3 confused pairs in the agent's prompt. When the
+   `persistent` flag fires it adds a "⚠️ Persistent weakness detected"
+   callout instructing the agent to write `## Data-layer recommendations`
+   in `next_instruction.md` AND reminding it that the Bash guard rejects
+   writes under `datasets/`.
+
+4. Boundary 1's `_DATASETS_WRITE_PATTERNS` is the wall behind that
+   reminder: sed -i / awk -i inplace / perl -i / > redirect / tee
+   targeting `datasets/` are all rejected. Reads stay allowed so the
+   agent can still cite specific sample counts and labels in its
+   recommendation.
+
+5. `scripts/generate_report.py:render_per_class_weaknesses` reproduces
+   both the machine ranking and the agent's `## Data-layer
+   recommendations` block (verbatim, read-only) in the final report —
+   the human sees the data-layer signal AND the agent's interpretation
+   side-by-side.
+
+No firewall changes here: per-class events are agent-VISIBLE by design,
+unlike `test_metrics`. The trust boundary is the *write* restriction
+on `datasets/`, not the *read* visibility of the diagnostic.
 
 To add a new operator-only event type, list it in
 `AGENT_INVISIBLE_EVENT_TYPES` AND add distinctive guard substrings to

@@ -302,6 +302,27 @@ Each Action shows a **complete** `next_params.json` you can Write directly. The 
 
 {{DATASET_SWITCH_GUIDANCE}}
 
+### Action K: Data-layer recommendations (READ-ONLY)
+
+**When**: The prompt contains a "⚠️ Persistent weakness detected" block. A class has been worst for ≥3 consecutive rounds — likely a data problem, not a hyperparameter one.
+
+**The rule**: You write a recommendation. You **do not** modify `datasets/`. The Bash guard rejects any write under `datasets/` (in-place editors, redirects, tee, cp/mv/install). Read-only access (`cat`, `find -print`, `grep`, `sed -n`) is allowed for diagnosis.
+
+**Output**: append a new section to `next_instruction.md`:
+
+```markdown
+## Data-layer recommendations
+
+### Class `<name>`
+- **Hypothesis**: <suspected labeling noise | insufficient samples | augmentation mismatch>
+- **Evidence**: <which confused-pair counts / mAP trajectory / support number drove this>
+- **Suggested human action**: <audit N labels | collect K more examples | review aug X for this class>
+```
+
+Pick ONE primary hypothesis per flagged class. Ground it in the numbers in the prompt's Per-class diagnosis block — the confused-pair counts are the highest-signal evidence. Keep it concise (5–10 lines per class).
+
+After writing, you may still launch a training run this round with whatever hyperparameter Action (A–J) you think is also worth trying — the recommendation does NOT consume the round. But: if recent rounds have ALREADY been data-bottlenecked, prefer skipping the run (write the recommendation and exit) so the human can act faster.
+
 ### Action J: Try Different Optimizer
 
 **When**: Default optimizer is stuck.

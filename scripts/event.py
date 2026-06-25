@@ -43,6 +43,12 @@ Event types (use kebab-case on the CLI; underscore in the JSON):
                        orthogonal-strategy nudge into the next prompt while
                        this warning is active. Cleared implicitly by a later
                        training_metrics that improves by ≥ threshold.
+  per-class-metrics    round, run_name, per_class (JSON dict), confusion
+                       (JSON list[list[int]]), class_names (JSON list[str])
+                       Emitted by per_class_metrics.py after a successful
+                       training run. Agent-visible: build_prompt.py surfaces
+                       a worst-classes + confused-pairs summary and (when
+                       persistent) a "data-layer recommendation" callout.
 
 Why we don't fancy schema-validate the payload:
   Harness §四 "fail loud" applies to safety; for an audit log we'd rather
@@ -80,6 +86,10 @@ EVENT_TYPES = {
     # Emitted by train.sh's plateau circuit; consumed by build_prompt.py to
     # inject the orthogonal-strategy nudge. Agent-visible by design.
     "plateau-detected",
+    # Emitted by per_class_metrics.py after each successful train. Carries
+    # per-class P/R/mAP + the confusion matrix. Agent-visible — build_prompt.py
+    # surfaces a worst-classes + confused-pairs summary.
+    "per-class-metrics",
 }
 
 
@@ -553,6 +563,14 @@ EVENT_FIELDS = {
     # Plateau circuit warning. All values are pulled from q_plateau_status.
     "plateau-detected":  {"round": int,    "n": int,           "threshold": float,
                           "improvement": float, "best_recent": float, "best_before": float},
+    # Per-class diagnostic carrying raw metrics for the round. build_prompt.py
+    # diagnoses on read (so the persistence-window N can change at any time
+    # without re-emitting). The "_json" suffix means build_payload parses the
+    # value as JSON and stores it under the unsuffixed key (per_class etc.).
+    "per-class-metrics": {"round": int,    "run_name": str,
+                          "per_class_json":   "json",
+                          "confusion_json":   "json",
+                          "class_names_json": "json"},
 }
 
 

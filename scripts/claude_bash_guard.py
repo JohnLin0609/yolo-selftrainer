@@ -91,6 +91,47 @@ def check_train_sh_write(subcommand: str) -> tuple[bool, str]:
     return True, ""
 
 
+# The dataset is operator-curated. The agent's role on data weakness is to
+# WRITE A RECOMMENDATION (next_instruction.md `## Data-layer recommendations`),
+# not to silently relabel / delete / mutate dataset files. Read-only access
+# (`cat`, `grep`, `find -print`, `sed -n`) stays allowed; only in-place
+# mutators and writes targeting the `datasets/` subtree are rejected.
+#
+# Same pattern shape as _TRAIN_SH_WRITE_PATTERNS — coarse, false-positive
+# tolerant. cp/mv/install are already in DENY_HEADS so we don't repeat them.
+_DATASETS_WRITE_PATTERNS = [
+    # `sed -i ... datasets/...` (-i may carry an optional backup suffix)
+    re.compile(r"\bsed\b[^|;&]*\s-i(\.[A-Za-z]+)?\b[^|;&]*\bdatasets/"),
+    # `awk -i inplace ... datasets/...`
+    re.compile(r"\bawk\b[^|;&]*\s-i\s+inplace\b[^|;&]*\bdatasets/"),
+    # `perl -i ... datasets/...`
+    re.compile(r"\bperl\b[^|;&]*\s-i(\.[A-Za-z]+)?\b[^|;&]*\bdatasets/"),
+    # `> datasets/...` / `>> datasets/...` — redirect anywhere whose target
+    # contains the datasets/ segment (catches `> ./datasets/foo`, `>> a/datasets/b`)
+    re.compile(r">>?\s*\S*\bdatasets/"),
+    # `tee datasets/...` / `tee -a datasets/...`
+    re.compile(r"\btee\b[^|;&]*\s\S*\bdatasets/"),
+]
+
+
+def check_datasets_write(subcommand: str) -> tuple[bool, str]:
+    """Return (allowed, reason). False = subcommand writes under datasets/.
+
+    Read-only inspection (cat/grep/find/sed -n/awk read-only) is unaffected
+    — only in-place mutators and redirect/tee targeting datasets/ are caught
+    here. cp/mv/install are blocked unconditionally via DENY_HEADS already.
+    """
+    for pat in _DATASETS_WRITE_PATTERNS:
+        if pat.search(subcommand):
+            return False, (
+                f"writes under datasets/ are blocked — surface data-layer "
+                f"issues as recommendations in next_instruction.md under "
+                f"`## Data-layer recommendations` instead "
+                f"(matched: {pat.pattern!r})"
+            )
+    return True, ""
+
+
 # Known bypass patterns for the head-token denylist. Each entry is
 # (compiled_regex, human-readable reason). The patterns are tight enough
 # to avoid false positives on legitimate idioms (read-only sed/awk, python3
@@ -213,6 +254,13 @@ def check_command(command: str) -> tuple[bool, str]:
         # This catches `bash -c "sed -i ... train.sh"`-style wrappers where
         # the head token is something benign.
         ok, reason = check_train_sh_write(sub)
+        if not ok:
+            return False, f"{reason} (subcommand: {sub!r})"
+        # Datasets/ are operator-curated. Agent surfaces recommendations,
+        # not writes. Runs immediately after train.sh-write because both
+        # are "trusted-asset" guards; ordering vs bypass patterns is
+        # irrelevant since they're disjoint.
+        ok, reason = check_datasets_write(sub)
         if not ok:
             return False, f"{reason} (subcommand: {sub!r})"
         # Bypass patterns: interpreter -c, eval, find -delete, awk system(),

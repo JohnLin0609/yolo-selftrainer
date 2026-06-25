@@ -451,6 +451,103 @@ def render_insights(runs: list[dict], test_by_name: dict[str, dict] | None = Non
     return "\n".join(lines)
 
 
+def render_per_class_weaknesses(events: list[dict], project_dir: Path) -> str:
+    """Per-class weakness section + agent's data-layer recommendations.
+
+    Reads the most recent per_class_metrics event, ranks weak classes via
+    diagnose_weak_classes, and reproduces (read-only) any
+    `## Data-layer recommendations` block the agent wrote in
+    next_instruction.md. The human reader sees both: the machine ranking
+    and the agent's prose interpretation.
+    """
+    per_class_events = sorted(
+        (e for e in events if e.get("type") == "per_class_metrics"),
+        key=lambda e: e.get("ts", ""),
+    )
+    if not per_class_events:
+        return ""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from diagnose_classes import diagnose_weak_classes
+    except ImportError:
+        return ""
+
+    latest = per_class_events[-1]
+    prior = per_class_events[:-1]
+    per_class = latest.get("per_class") or {}
+    confusion = latest.get("confusion") or []
+    class_names = latest.get("class_names") or []
+    if not per_class:
+        return ""
+
+    # Lightweight history for persistence detection — mirror build_prompt.py
+    history: list[dict] = []
+    for ev in prior:
+        pc = ev.get("per_class") or {}
+        if not pc:
+            history.append({"worst": []})
+            continue
+        ranked = sorted(
+            pc.items(),
+            key=lambda kv: (
+                float((kv[1] or {}).get("mAP50", 0.0) or 0.0),
+                int((kv[1] or {}).get("support", 0) or 0),
+                kv[0],
+            ),
+        )
+        history.append({"worst": [{"class": ranked[0][0]}]})
+
+    d = diagnose_weak_classes(
+        per_class, confusion, class_names,
+        history=history, persistent_n=3, metric="mAP50",
+    )
+
+    lines = ["## Per-class weaknesses"]
+    lines.append(
+        f"_Latest run: `{latest.get('run_name', '?')}` (round {latest.get('round', '?')})_"
+    )
+    lines.append("")
+    if d["worst"]:
+        lines.append("| Rank | Class | mAP50 | Support | Persistent |")
+        lines.append("|---|---|---|---|---|")
+        for i, w in enumerate(d["worst"], 1):
+            mark = "**yes**" if w.get("persistent") else "no"
+            lines.append(
+                f"| {i} | `{w['class']}` | {fmt(w['score'])} | {w['support']} | {mark} |"
+            )
+    if d["confused_pairs"]:
+        lines.append("")
+        lines.append("**Most-confused pairs** (true → predicted):")
+        for p in d["confused_pairs"]:
+            lines.append(f"- `{p['a']}` → `{p['b']}`: {p['count']}")
+    if d["recommend_data_review"]:
+        flagged = ", ".join(f"`{c}`" for c in d["recommend_data_review"])
+        lines.append("")
+        lines.append("### ⚠️ Persistent weakness flagged")
+        lines.append(
+            f"Class(es) {flagged} have been worst for ≥3 consecutive rounds. "
+            "Likely root cause is in the dataset (labeling noise, sample count, "
+            "or augmentation fit). Below: the agent's data-layer recommendations "
+            "from `next_instruction.md` (read-only — agent never modifies datasets/)."
+        )
+
+    # Pull the agent's `## Data-layer recommendations` block verbatim, if any.
+    ni = project_dir / "next_instruction.md"
+    if ni.exists():
+        text = ni.read_text()
+        marker = "## Data-layer recommendations"
+        idx = text.find(marker)
+        if idx >= 0:
+            tail = text[idx:]
+            # Cut at the next level-2 heading
+            next_h = tail.find("\n## ", 1)
+            block = tail if next_h < 0 else tail[:next_h]
+            lines.append("")
+            lines.append(block.rstrip())
+
+    return "\n".join(lines)
+
+
 def _read_max_rounds(project_dir: Path) -> int | None:
     """Look up MAX_ROUNDS from whichever start_*.sh exists. Returns None if
     not parseable — the Loop-cost table just omits the denominator then.
@@ -508,6 +605,10 @@ def main() -> int:
     report_lines.append("")
     report_lines.append(render_metrics_table(runs, test_by_name))
     report_lines.append("")
+    per_class_block = render_per_class_weaknesses(events, args.project_dir)
+    if per_class_block:
+        report_lines.append(per_class_block)
+        report_lines.append("")
     report_lines.append(render_progression_bar_chart(runs, test_by_name))
     report_lines.append("")
     report_lines.append(render_run_history_section(runs, args.runs_dir))
