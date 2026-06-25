@@ -11,33 +11,42 @@ over silent fallback, and budget-aware context engineering.
 ## The loop
 
 ```
-┌────────────────────┐    1. preflight (GPU / disk / dataset)
-│ start_self_train   │ ──→ 2. scaffold projects/<name>/
-└──────────┬─────────┘    3. exec start_claude.sh OR start_agent.sh
-           │
+┌────────────────────┐    1. parse CLI flags, auto-detect task/classes/imgsz
+│ new_project.sh     │ ──→ 2. carve held-out test split (locked seed)
+└──────────┬─────────┘    3. scaffold projects/<name>/ from templates/
+           │                 (start_claude.sh | start_agent.sh | start_baseline.sh
+           │                  depending on --mode)
            ▼
 ┌────────────────────┐
 │  start_*.sh        │     - HALTED check → exit if present
 │  (per round)       │     - per-round preflight
 │                    │     - bump round counter (round_started event)
-│                    │     - build prompt (events.jsonl facts + Claude's notes)
-│                    │     - run agent (claude CLI or run_agent.py via LiteLLM)
+│                    │     - claude/agent: build prompt + invoke LLM
+│                    │     - baseline: invoke baseline_policy.py
 └──────────┬─────────┘
-           │ agent decides what to change, sed-edits train.sh,
-           │ launches `nohup bash train.sh &` (detached)
+           │ claude/agent: agent writes next_params.json (the structured
+           │   param contract — apply_params.py validates against
+           │   param_bounds.py and writes effective_params.env)
+           │ baseline: baseline_policy.py prints KEY=VALUE pairs that
+           │   the orchestrator sed-edits into train.sh
+           │ in all modes: launches `nohup bash train.sh > current.log 2>&1 &`
            ▼
 ┌────────────────────┐
-│  train.sh          │     - param validator (range-check, abort on violation)
+│  train.sh          │     - apply_params.py + defense-in-depth param validator
 │                    │     - yolo {task} train ... (foreground)
 │                    │     - emit training_finished + training_metrics events
-│                    │     - on success: clear consecutive_failures
+│                    │     - per_class_metrics.py: re-run val(), emit per-class
+│                    │     - run_test_eval.py: held-out test split (agent-invisible)
+│                    │     - plateau circuit: q_plateau_status → warn / halt
 │                    │     - on crash: circuit breaker (3 strikes → HALTED)
 │                    │     - rm train.pid, then recurse: bash start_*.sh
 └────────────────────┘
 ```
 
 Each step that mutates state emits an event. After N rounds, the chain
-naturally stops (`MAX_ROUNDS` check at the top of `start_*.sh`).
+naturally stops (`MAX_ROUNDS` check at the top of `start_*.sh`). The
+plateau circuit can stop earlier if the primary metric stops moving for
+N+M consecutive rounds.
 
 ---
 
@@ -454,7 +463,9 @@ Trade-offs intentionally taken:
 
 ## Bootstrap order
 
-`start_self_training.sh` follows the Harness §11 discipline:
+`scripts/new_project.sh` (one-time scaffold) and `scripts/preflight.sh`
+(invoked from every `start_*.sh` wakeup) jointly follow the Harness §11
+discipline:
 
 | Category | Check | Action on failure |
 |---|---|---|
@@ -475,17 +486,26 @@ state is surfaced loudly.
 
 ```
 yolo-selftrainer/
-├── start_self_training.sh        # the front door — scaffold + launch
 ├── scripts/
 │   ├── setup_env.sh              # .venv + ultralytics + litellm + models
 │   ├── download_models.sh        # pretrained yolo11n.pt, yolov8n.pt, etc.
 │   ├── download_demo_dataset.sh  # COCO128 subset for quickstart
-│   ├── new_project.sh            # scaffold projects/<name>/ from templates
+│   ├── new_project.sh            # THE FRONT DOOR — scaffold projects/<name>/
 │   ├── preflight.sh              # --cold (full check) / --quick (per-round)
 │   ├── event.py                  # events.jsonl emit + query CLI
 │   ├── build_prompt.py           # per-round prompt with facts+metrics+prose
+│   ├── param_bounds.py           # bounds source-of-truth for next_params.json
+│   ├── apply_params.py           # validates next_params.json → effective_params.env
+│   ├── baseline_policy.py        # LLM-free random-search policy (--mode baseline)
+│   ├── per_class_metrics.py      # model.val() → per_class_metrics event
+│   ├── diagnose_classes.py       # pure rank-and-flag for per-class weakness
+│   ├── run_test_eval.py          # held-out test split (agent-invisible)
 │   ├── run_agent.py              # LiteLLM ReAct loop (agent mode)
-│   ├── claude_bash_guard.py      # PreToolUse Bash deny-list filter
+│   ├── claude_bash_guard.py      # Bash deny-list + bypass patterns + datasets/ guard
+│   ├── sandbox.py                # bwrap wrapper for agent-mode Bash (optional)
+│   ├── benchmark.py              # cross-provider sweep orchestrator
+│   ├── benchmark_aggregate.py    # pure events.jsonl → ProviderRow
+│   ├── benchmark_render.py       # pure ProviderRow[] → Markdown table
 │   ├── generate_report.py        # final-round training_report.md
 │   └── test_agent_smoke.py       # one-turn smoke test per provider
 ├── templates/

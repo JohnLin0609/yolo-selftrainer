@@ -64,8 +64,9 @@ tool-call loops; the circuit breaker will eventually HALT.
 
 ```bash
 ollama pull qwen3:8b
-bash start_self_training.sh --dataset ./datasets/my_data --rounds 5 \
-    --mode agent --provider ollama --model qwen3:8b
+bash scripts/new_project.sh --dataset ./datasets/my_data --max-rounds 5 \
+    --mode agent --llm-provider ollama --llm-model qwen3:8b
+cd projects/my_data && bash start_agent.sh
 ```
 
 Tips:
@@ -95,9 +96,10 @@ Untested in this framework but theoretically the best local fit.
 vllm serve Qwen/Qwen3-32B --enable-auto-tool-choice --tool-call-parser hermes
 
 # Then on your dev machine
-bash start_self_training.sh --dataset ./datasets/my_data --rounds 5 \
-    --mode agent --provider vllm --model Qwen3-32B \
-    --api-base http://<vllm-server>:8000/v1
+bash scripts/new_project.sh --dataset ./datasets/my_data --max-rounds 5 \
+    --mode agent --llm-provider vllm --llm-model Qwen3-32B \
+    --llm-api-base http://<vllm-server>:8000/v1
+cd projects/my_data && bash start_agent.sh
 ```
 
 vLLM's tool-call parsing is more reliable than Ollama's.

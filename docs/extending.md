@@ -60,7 +60,8 @@ To add Action L (say, "swap to yolov11s for the final push"):
 
 ### 1. Edit `templates/hyperparameter_strategy.md.tmpl`
 
-Insert after Action J:
+Insert after Action J (and before Action K, which is data-layer
+recommendations — see `templates/hyperparameter_strategy.md.tmpl`):
 
 ```markdown
 ### Action L: Upgrade to Small (yolo11s) for final push
@@ -70,15 +71,26 @@ tuning and want to test if a slightly larger model can push higher.
 
 **Cost**: 2-3x slower training, 2-3x memory, ~2x model size.
 
-\`\`\`bash
-sed -i 's|^WEIGHTS=.*|WEIGHTS=${1:-"{{MODELS_DIR}}/yolo11s.pt"}|' {{PROJECT_DIR}}/train.sh
-sed -i 's/^LR=.*/LR=0.01/' {{PROJECT_DIR}}/train.sh   # reset for new arch
-sed -i 's/^EPOCHS=.*/EPOCHS=150/' {{PROJECT_DIR}}/train.sh
+\`\`\`json
+{
+  "WEIGHTS": "{{MODELS_DIR}}/yolo11s.pt",
+  "EPOCHS": 150, "PATIENCE": 60,
+  "LR": 0.01, "LR_FINAL": 0.01,
+  "IMGSZ": {{IMGSZ}}, "BATCH": -1, "OPTIMIZER": "AdamW"
+}
 \`\`\`
+
+Write this to `next_params.json` via the `Write` tool — the agent never
+sed-edits `train.sh`. `scripts/apply_params.py` validates the JSON
+against `scripts/param_bounds.py` and produces `effective_params.env`
+that train.sh sources.
 
 **Rules**:
 - Use **pretrained** yolo11s.pt — NOT a nano best.pt (arch incompatible)
 - Reset LR to 0.01 (fresh start for new arch)
+- Add `yolo11s.pt` to `BASE_BOUNDS["WEIGHTS"]["allow"]` in
+  `scripts/param_bounds.py` if it's not already there, otherwise the
+  validator will reject the round.
 ```
 
 ### 2. Make sure `scripts/download_models.sh` pulls yolo11s.pt

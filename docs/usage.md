@@ -300,17 +300,23 @@ scaffolded defaults (the "no-tuning floor"). No LLM is called.
 
 ```bash
 # Default seed (42)
-bash start_self_training.sh --dataset /path/to/dataset --rounds 10 --mode baseline
+bash scripts/new_project.sh --dataset /path/to/dataset --max-rounds 10 \
+    --mode baseline
+cd projects/<name> && bash start_baseline.sh
 
 # Pin the seed for explicit reproducibility (same seed → same trajectory)
-bash start_self_training.sh --dataset /path/to/dataset --rounds 10 \
+bash scripts/new_project.sh --dataset /path/to/dataset --max-rounds 10 \
     --mode baseline --baseline-seed 7
+cd projects/<name> && bash start_baseline.sh
 ```
 
-The chosen params are sed-edited into `train.sh` and emitted as a
-`baseline-decision` event in `events.jsonl`. From train.sh's perspective
-nothing changes — same validator, same circuit breaker, same metric
-extraction, same held-out test eval.
+`scripts/baseline_policy.py` prints KEY=VALUE pairs, which
+`start_baseline.sh` sed-edits into `train.sh` and emits as a
+`baseline-decision` event in `events.jsonl`. Unlike agent mode (which
+goes through the `next_params.json` contract), baseline doesn't need the
+validator — the policy samples directly from the validator bounds. From
+train.sh's perspective the rest is identical: same circuit breaker, same
+metric extraction, same held-out test eval, same plateau circuit.
 
 ### How to compare two reports
 
