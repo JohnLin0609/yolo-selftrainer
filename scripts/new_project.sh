@@ -437,9 +437,15 @@ if [ -z "$CLASSES" ]; then
     elif [ -f "$DATASET/classes.txt" ]; then
         CLASSES=$(awk '{printf "%d:%s,", NR-1, $0}' "$DATASET/classes.txt" | sed 's/,$//')
     else
-        FIRST_LABEL=$(find "$DATASET/labels" -name "*.txt" -type f 2>/dev/null | head -1)
-        if [ -n "$FIRST_LABEL" ]; then
-            NUM_CLASSES=$(awk '{print $1}' "$FIRST_LABEL" | sort -u | wc -l)
+        # Scan ALL label files for the max class ID. NUM_CLASSES = max_id + 1
+        # (YOLO requires names to cover [0, NUM_CLASSES-1]; gaps are fine).
+        # Reading just the first file misses any class that doesn't appear in
+        # image #1, which on multi-class datasets undercounts wildly.
+        MAX_CLASS_ID=$(find "$DATASET/labels" -name "*.txt" -type f 2>/dev/null \
+            -exec awk '{print $1}' {} + 2>/dev/null \
+            | sort -un | tail -1)
+        if [ -n "$MAX_CLASS_ID" ]; then
+            NUM_CLASSES=$((MAX_CLASS_ID + 1))
             CLASSES=$(seq 0 $((NUM_CLASSES - 1)) | awk '{printf "%d:class_%d,", $1, $1}' | sed 's/,$//')
         else
             CLASSES="0:class_0"
