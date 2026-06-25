@@ -586,10 +586,19 @@ echo "[INFO] Dataset YAML: $DATASET_YAML_PATH"
 DATASET_EVAL_YAML_PATH="$ROOT_DIR/datasets/$NAME/dataset.eval.yaml"
 if [ "$STRICT_HELDOUT" = "true" ] && [ "$TEST_COUNT" -gt 0 ]; then
     echo "[strict-heldout] splitting dataset.yaml into agent-visible + eval-only"
-    TEST_LINE=$(grep -E '^test:' "$DATASET_YAML_PATH" || true)
-    # Build the eval yaml: path + just test: + names (so yolo val can resolve classes)
+    TRAIN_LINE=$(grep -E '^train:' "$DATASET_YAML_PATH" || true)
+    VAL_LINE=$(grep -E '^val:'   "$DATASET_YAML_PATH" || true)
+    TEST_LINE=$(grep -E '^test:'  "$DATASET_YAML_PATH" || true)
+    # Build the eval yaml. ultralytics validates the schema even on a val-only
+    # call: train: is a REQUIRED key, omitting it raises "Dataset 'path' is
+    # missing 'train:' key." So we re-emit train: + val: pointing at the
+    # same agent-visible directories. The split= argument controls which one
+    # model.val() actually reads — test: is what scripts/run_test_tool.py asks
+    # for; train:/val: just satisfy the schema.
     {
         grep -E '^path:' "$DATASET_YAML_PATH"
+        echo "$TRAIN_LINE"
+        echo "$VAL_LINE"
         echo "$TEST_LINE"
         echo ""
         # Re-emit names: block (works for both `names:` mapping and `names: [...]`
