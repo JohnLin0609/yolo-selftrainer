@@ -283,6 +283,95 @@ scaffolded value when omitted from a round.
 
 ---
 
+## LeetCode-grade hidden test split with `--strict-heldout`
+
+By default Boundary 4 ("operator-only data") is **prompt-level**: the agent's
+prompt doesn't carry `test_metrics`, but a knowledgeable agent can still
+`cat datasets/<name>/labels/test/*` or run `yolo val split=test` itself.
+`--strict-heldout` upgrades the contract to "agent process cannot reach
+the test data at all, but can submit a model and get one aggregate score
+back" — like LeetCode's hidden test cases.
+
+### How to scaffold
+
+```bash
+bash scripts/new_project.sh --dataset ./datasets/wheel --max-rounds 5 \
+    --strict-heldout \
+    --mode claude    # or --mode agent (the path-deny still applies)
+cd projects/wheel && bash start_claude.sh
+```
+
+What `--strict-heldout` adds at scaffold time:
+
+- **Dual `dataset.yaml`**: the agent-visible `datasets/<name>/dataset.yaml`
+  loses its `test:` key. An operator-only sibling `dataset.eval.yaml`
+  carries the `test:` pointer and the class names. `run_test_eval.py`
+  (called automatically from `train.sh` post-train) auto-falls-back to
+  the eval yaml, so the test_metrics audit trail keeps working.
+- **`projects/<name>/.heldout_strict`** marker file. The Bash guard walks
+  up cwd looking for this; when present, `_HELDOUT_READ_PATTERNS` rejects
+  every direct read of `datasets/.../(images|labels)/test/`, all
+  `yolo val split=test` variations, and Python `split="test"` smuggling.
+- **`.claude/settings.json` permissions block** (Claude-CLI mode only):
+  Claude's own permission system rejects exfil attempts before the Bash
+  guard even sees them.
+- **Randomized test seed by default**: each scaffold gets a fresh test
+  split. Pin via `--test-seed N` for reproducibility (e.g. benchmarking).
+
+### The LeetCode submit tool
+
+The sole sanctioned route to a test score:
+
+```bash
+python3 scripts/run_test_tool.py --project projects/<name>
+```
+
+Stdout is exactly one line:
+
+```
+mAP50=0.7842 mAP50-95=0.4561 images=18
+```
+
+No per-class breakdown, no class names, no file paths, no confusion matrix.
+
+**Rate limit**: ONE call per round. The tool reads `events.jsonl`; if a
+`test_tool_query` event already exists for the current round, the second
+call fails with exit 1 and "already queried this round". Every call emits
+a `test_tool_query` event (agent-INVISIBLE — firewalled in
+`build_prompt.py` so the score never re-enters a future prompt).
+
+The action playbook section is templated into `hyperparameter_strategy.md`
+as Action M when `--strict-heldout` is set — so the agent learns about
+the tool from its system prompt without needing to be told manually.
+
+### When NOT to use `--strict-heldout`
+
+- **Quick experiments where you want full visibility.** The default
+  Boundary 4 (prompt-level firewall + behavioral steer) is fine for the
+  "accidentally fits to test via prompts" threat model. Strict mode is
+  for when you want the "adversarial agent" contract.
+- **Operations that legitimately need many test peeks.** Hyperparameter
+  search where the test mAP is your selection criterion. (At that point
+  the held-out split is effectively a val split; treat it as such.)
+- **agent mode (LiteLLM) on weaker providers.** The submit tool itself
+  is Claude-only in this release — the path-deny part of the protection
+  works in agent mode too, but the equivalent "submit" tool would need
+  to be registered in `TOOL_DEFINITIONS` per provider. Follow-up work.
+
+### Audit trail
+
+Every strict-heldout decision lands in `events.jsonl`:
+
+```
+heldout_cut       — scaffold time: seed + n_test_images + dataset name
+test_tool_query   — every submit-tool call: round + run_name + score
+```
+
+Both are firewalled from prompts but visible to the operator via
+`scripts/event.py <project> query` or by reading the file directly.
+
+---
+
 ## Measuring agent uplift with `--mode baseline`
 
 The agent (claude or litellm) decides hyperparameters each round. But is its

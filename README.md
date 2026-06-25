@@ -202,8 +202,16 @@ bash scripts/new_project.sh --dataset PATH [options]
   --llm-api-base URL     Custom OpenAI-compatible endpoint (vLLM, self-host)
 
   --test-split RATIO     Held-out test split fraction (default: 0.15; 0 disables)
-  --test-seed SEED       RNG seed locking the test split (default: 42)
+  --test-seed SEED       RNG seed locking the test split (default: 42; auto-
+                         randomized when --strict-heldout and not pinned)
   --baseline-seed SEED   RNG seed for --mode baseline (default: 42)
+  --strict-heldout       LeetCode-grade hidden test split. Agent's dataset.yaml
+                         loses its test: key (moved to dataset.eval.yaml). The
+                         Bash guard rejects all direct reads of the test split.
+                         The sole sanctioned route to the score is
+                         `python3 scripts/run_test_tool.py --project <dir>`,
+                         which returns one line: mAP50=X.XXXX mAP50-95=X.XXXX
+                         images=N. Rate-limited to one peek per round.
   --force                Overwrite an existing project
 ```
 
