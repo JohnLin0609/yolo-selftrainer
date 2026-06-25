@@ -197,17 +197,25 @@ fi
 printf '%s\n' "$PROMPT" > "$TEMP_LOG_DIR/instruction.md"
 
 # ─── Run Claude and capture full output ──────────────────────────────
-# Trust model (Harness §5.1): --dangerously-skip-permissions bypasses the
-# permission system so the unattended loop has no UI prompts. The REAL safety
-# boundary is the PreToolUse hook registered in .claude/settings.json
-# (scripts/claude_bash_guard.py) which blocks rm/pip/sudo/mv/etc. regardless
-# of permission mode. Hooks fire even when permissions are skipped.
+# Trust model — two layers:
+#   1. PreToolUse hook (claude_bash_guard.py): fires on every Bash call
+#      regardless of permission mode. Blocks rm/pip/sudo/mv/etc.
+#   2. permissions.allow/deny in .claude/settings.json (especially the
+#      strict-heldout deny rules for the held-out images/labels): only
+#      active under permission-mode "auto" / "default". --permission-mode
+#      auto applies those rules without prompting the user, which is what
+#      an unattended loop needs.
+#
+# Earlier versions used --dangerously-skip-permissions, which skips the
+# entire permission system — leaving only layer 1. That made the
+# strict-heldout deny entries dead code. "auto" mode preserves both layers
+# and still emits no UI prompts.
 #
 # --allowedTools MUST remain last: it is variadic and will consume any
 # following positional arguments as tool names.
 $EVENT emit claude-started --round "$ROUND" --session-id "$SESSION_ID" || true
 CLAUDE_START_TS=$SECONDS
-if printf '%s\n' "$PROMPT" | claude --dangerously-skip-permissions \
+if printf '%s\n' "$PROMPT" | claude --permission-mode auto \
   --print \
   --verbose \
   --output-format stream-json \
@@ -220,8 +228,28 @@ else
   CLAUDE_EXIT=$?
 fi
 CLAUDE_DURATION=$((SECONDS - CLAUDE_START_TS))
+
+# Pull total_cost_usd off the last `result` message in the raw JSONL.
+# Defaults to 0.0 on the abnormal paths (SIGKILL before any result line,
+# empty JSONL, malformed lines) so the claude-finished schema is satisfied
+# either way. The full breakdown still lives in the extracted session.log.
+CLAUDE_COST=$(python3 - "$TEMP_LOG_DIR/claude_raw.jsonl" <<'PY'
+import json, sys
+cost = 0.0
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            try: msg = json.loads(line)
+            except: continue
+            if msg.get("type") == "result":
+                cost = float(msg.get("total_cost_usd") or 0.0)
+except FileNotFoundError:
+    pass
+print(f"{cost:.6f}")
+PY
+)
 $EVENT emit claude-finished --round "$ROUND" --exit-code "$CLAUDE_EXIT" \
-  --duration-sec "$CLAUDE_DURATION" || true
+  --duration-sec "$CLAUDE_DURATION" --total-cost-usd "$CLAUDE_COST" || true
 
 # ─── Extract readable log from stream-json ────────────────────────────
 python3 -c "

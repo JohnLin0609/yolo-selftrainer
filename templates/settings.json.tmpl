@@ -1,5 +1,5 @@
 {
-  "_comment": "PreToolUse Bash guard. Runs even with --dangerously-skip-permissions (hooks fire regardless of permission mode). See scripts/claude_bash_guard.py for the deny list.",
+  "_comment": "PreToolUse Bash guard + permissions allow/deny. Loop runs Claude with --permission-mode auto so deny rules here ARE enforced; this hook also fires regardless of permission mode as defense in depth. See scripts/claude_bash_guard.py.",
   "hooks": {
     "PreToolUse": [
       {

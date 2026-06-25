@@ -2,10 +2,11 @@
 """PreToolUse hook: validate Bash commands against a deny list.
 
 Why this exists (Harness §5.1, §4.6):
-  start_claude.sh runs Claude with --dangerously-skip-permissions so the
-  autonomous loop has no UI prompts. That removes Claude Code's built-in
-  permission layer, so we restore the safety boundary with a hook that runs
-  BEFORE every Bash call. Hooks fire regardless of permission mode.
+  start_claude.sh runs Claude with --permission-mode auto so the autonomous
+  loop has no UI prompts. "auto" still honors permissions.allow/deny in
+  .claude/settings.json (which strict-heldout relies on) but lifts the
+  interactive prompts. We add this hook as a hard backstop that runs BEFORE
+  every Bash call, regardless of permission mode — defense in depth.
 
   Compound commands are split on logical operators (&&, ||, ;, |, &) and the
   head token of EACH subcommand is checked against the deny list. A compound
@@ -397,8 +398,8 @@ def main():
     # exit 2 + stderr is shown to the model so it can recover / re-plan.
     print(
         f"BLOCKED by yolo_selftrainer safety guard: {reason}\n"
-        f"This guard runs because the autonomous loop uses "
-        f"--dangerously-skip-permissions. If this command is genuinely needed, "
+        f"This guard runs on every Bash call as a backstop to settings.json "
+        f"permissions. If this command is genuinely needed, "
         f"a human must edit scripts/claude_bash_guard.py to allow it.",
         file=sys.stderr,
     )
