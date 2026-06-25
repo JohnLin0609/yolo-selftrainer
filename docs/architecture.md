@@ -370,6 +370,56 @@ No firewall changes here: per-class events are agent-VISIBLE by design,
 unlike `test_metrics`. The trust boundary is the *write* restriction
 on `datasets/`, not the *read* visibility of the diagnostic.
 
+#### Strict-heldout (`--strict-heldout`) — LeetCode mode
+
+The standard Boundary 4 is **prompt-level**: it guarantees the agent's
+prompt doesn't carry test metrics. An agent that knows the ultralytics
+API can still `cat datasets/<name>/labels/test/*.txt` or
+`yolo val split=test ...` itself — `yolo` isn't on `DENY_HEADS`. The
+firewall is honest about this with its docstring: "agent never sees
+test data **via prompts**".
+
+`--strict-heldout` upgrades the contract to "agent process cannot reach
+the test data at all, but can submit its current model and get back a
+single aggregate score" — the LeetCode contract. Activated by
+`scripts/new_project.sh --strict-heldout`, layered as four pieces:
+
+1. **Dual-yaml**. The agent-visible `datasets/<name>/dataset.yaml` loses
+   its `test:` key; an operator-only sibling `dataset.eval.yaml` carries
+   it. `run_test_eval.py` and the new `run_test_tool.py` read the eval
+   yaml; `train.sh` reads the agent yaml.
+2. **Marker file + Bash-guard patterns**. `projects/<name>/.heldout_strict`
+   is a sentinel `claude_bash_guard.py` walks up looking for from cwd.
+   When present, `_HELDOUT_READ_PATTERNS` reject every direct exfil
+   route: any path under `datasets/.../(images|labels)/test/`, any
+   `yolo val split=test` (string-literal or quoted), any `split="test"`
+   Python keyword smuggling. The sole sanctioned exit is
+   `python3 scripts/run_test_tool.py …`, whitelisted in the same
+   `check_command` pass.
+3. **`.claude/settings.json` permissions** (Claude-CLI mode only).
+   `new_project.sh --strict-heldout` injects a `permissions.deny`
+   block listing the test paths + `split=test` patterns and a
+   `permissions.allow` entry whitelisting the run_test_tool.py
+   invocation. `run_agent.py` (LiteLLM) doesn't read this file but is
+   covered by #2.
+4. **The LeetCode submit tool** (`scripts/run_test_tool.py`).
+   Score-only stdout (`mAP50=X.XXXX mAP50-95=X.XXXX images=N`); no
+   per-class, no class names, no file paths. Rate-limited to one peek
+   per round via an idempotency check on `test_tool_query` events at
+   the current round. Every invocation emits a `test_tool_query` event
+   that is itself agent-INVISIBLE (added to `AGENT_INVISIBLE_EVENT_TYPES`)
+   so the score never re-enters a subsequent prompt.
+
+The randomized test seed (`--strict-heldout` rolls one fresh per scaffold
+unless `--test-seed` is pinned) plus the `heldout-cut` event (operator-
+audit-only) close the loop: each project sees a fresh randomly-sampled
+test split that the agent cannot enumerate, cannot read, and can only
+score against once per round.
+
+Out of scope for this layer: LiteLLM-mode equivalent of the submit tool
+(currently Claude-only); rotating the test split across rounds within
+one project (would break round-to-round comparability).
+
 To add a new operator-only event type, list it in
 `AGENT_INVISIBLE_EVENT_TYPES` AND add distinctive guard substrings to
 `_PROMPT_GUARD_TERMS` in the same file. Both must be updated together.

@@ -76,10 +76,17 @@ def scaffold_project(
     framework_root: Path, project_name: str,
     provider: str, model: str, api_base: str | None,
     dataset: Path, rounds: int, task: str | None, device: int,
+    *,
+    strict_heldout: bool = False, test_seed: int | None = None,
 ) -> Path:
     """Invoke scripts/new_project.sh and return the path to the scaffolded
     project directory. Forces overwrite — benchmark runs are
-    reproducible; re-running the orchestrator should reset state."""
+    reproducible; re-running the orchestrator should reset state.
+
+    In strict-heldout sweeps every provider must see the SAME test split
+    (apples-to-apples), so the caller passes a pinned test_seed and the
+    scaffold pins it across the sweep.
+    """
     cmd = [
         "bash", str(framework_root / "scripts" / "new_project.sh"),
         "--dataset",     str(dataset),
@@ -95,6 +102,10 @@ def scaffold_project(
         cmd.extend(["--task", task])
     if api_base:
         cmd.extend(["--llm-api-base", api_base])
+    if strict_heldout:
+        cmd.append("--strict-heldout")
+    if test_seed is not None:
+        cmd.extend(["--test-seed", str(test_seed)])
 
     print(f"[benchmark] scaffolding {project_name} ({provider}/{model})", flush=True)
     proc = subprocess.run(cmd, cwd=framework_root, capture_output=True, text=True)
@@ -168,6 +179,13 @@ def main() -> int:
                     help="custom OpenAI-compatible endpoint, applied to ALL "
                          "providers that need one (vllm). Per-provider api-base "
                          "is intentionally not supported — keep the sweep simple.")
+    ap.add_argument("--strict-heldout", action="store_true",
+                    help="enable LeetCode-mode held-out test split for every "
+                         "scaffolded project. The test seed is pinned (via "
+                         "--bench-seed) so all providers see the same test set.")
+    ap.add_argument("--bench-seed", type=int, default=42,
+                    help="pinned --test-seed value passed to new_project.sh. "
+                         "Only meaningful with --strict-heldout; ignored otherwise.")
     args = ap.parse_args()
 
     if len(args.providers) != len(args.models):
@@ -213,6 +231,8 @@ def main() -> int:
                 framework_root, project_name,
                 provider, model, args.api_base,
                 args.dataset, args.rounds, args.task, args.device,
+                strict_heldout=args.strict_heldout,
+                test_seed=args.bench_seed if args.strict_heldout else None,
             )
             exit_code = run_session(proj_dir)
             if exit_code != 0:

@@ -156,7 +156,13 @@ the `Bash` tool. Five trust boundaries — see
    runs `yolo val split=test` after each successful round and emits
    `test_metrics` events. These events are agent-INVISIBLE
    (`AGENT_INVISIBLE_EVENT_TYPES` in `build_prompt.py`) so the agent can't
-   overfit the unbiased benchmark.
+   overfit the unbiased benchmark. **Optional `--strict-heldout` mode**
+   upgrades the contract to LeetCode-grade: dual `dataset.yaml` /
+   `dataset.eval.yaml` so the agent's view never names the test split;
+   Bash-guard patterns reject every direct read of `images/test/` /
+   `labels/test/` / `split=test`; the agent can submit a model via
+   `scripts/run_test_tool.py` for a one-line aggregate score (rate-limited
+   one peek per round), but cannot enumerate or read the data.
 5. **Plateau circuit** (additive to #3): when the primary metric stops
    moving over a sliding window, `train.sh` emits a `plateau_detected`
    event. The next prompt carries an orthogonal-strategy nudge ("DO NOT

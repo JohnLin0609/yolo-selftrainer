@@ -93,6 +93,15 @@ EVENT_TYPES = {
     # per-class P/R/mAP + the confusion matrix. Agent-visible — build_prompt.py
     # surfaces a worst-classes + confused-pairs summary.
     "per-class-metrics",
+    # Emitted by new_project.sh when --strict-heldout carves the test split.
+    # Records the seed + count for the operator audit trail. Agent-INVISIBLE
+    # (the seed could let a clever agent reconstruct which images are in
+    # the test split if they have the source dataset).
+    "heldout-cut",
+    # Emitted by run_test_tool.py every time the agent invokes the LeetCode
+    # submit. Records round + score returned. Agent-INVISIBLE — feeding the
+    # score back into a future prompt defeats the whole point.
+    "test-tool-query",
 }
 
 
@@ -578,6 +587,14 @@ EVENT_FIELDS = {
                           "per_class_json":   "json",
                           "confusion_json":   "json",
                           "class_names_json": "json"},
+    # Strict-heldout audit trail. Emitted once at scaffold time by
+    # new_project.sh when --strict-heldout is set.
+    "heldout-cut":      {"seed": int, "n_test_images": int, "dataset": str},
+    # LeetCode submit-button invocation. Emitted by run_test_tool.py every
+    # time the agent calls it. round is which loop round we're in;
+    # best_metric_value is what the tool returned to the agent.
+    "test-tool-query":  {"round": int, "run_name": str,
+                         "best_metric_name": str, "best_metric_value": float},
 }
 
 

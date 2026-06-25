@@ -144,8 +144,18 @@ def main() -> int:
     # val under the hood.
     _, test_rel = parse_yaml_path_test(args.data)
     if test_rel is None:
-        print(f"[test-eval] ERROR: dataset yaml has no `test:` key — refusing to run", file=sys.stderr)
-        return 1
+        # Strict-heldout mode: dataset.yaml has no test: key (moved to
+        # dataset.eval.yaml). Try the sibling file before giving up.
+        sibling = args.data.parent / "dataset.eval.yaml"
+        if sibling.is_file():
+            print(f"[test-eval] dataset.yaml lacks `test:`; using {sibling.name} "
+                  "(strict-heldout dual-yaml)", file=sys.stderr)
+            args.data = sibling
+            _, test_rel = parse_yaml_path_test(args.data)
+        if test_rel is None:
+            print(f"[test-eval] ERROR: dataset yaml has no `test:` key — refusing to run",
+                  file=sys.stderr)
+            return 1
 
     n_test = count_test_images(args.data)
     if n_test == 0:

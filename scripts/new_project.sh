@@ -33,9 +33,18 @@ LLM_API_BASE=""
 # Held-out test split (agent-invisible). 0 disables. Seed locks reproducibility.
 TEST_SPLIT="0.15"
 TEST_SEED="42"
+# Whether the operator passed --test-seed explicitly. Used in strict-heldout
+# mode to decide between auto-randomize (default) and pinned-seed.
+TEST_SEED_EXPLICIT=false
 # Baseline-mode RNG seed (only used when --mode baseline). Same seed → same
 # random-search trajectory, so two baseline projects are byte-for-byte equal.
 BASELINE_SEED="42"
+# LeetCode-mode held-out test split. When true:
+#   - dataset.eval.yaml carries the test: key, dataset.yaml does NOT
+#   - .heldout_strict marker activates claude_bash_guard's heldout patterns
+#   - .heldout_seed records the (possibly randomized) test seed
+#   - heldout-cut event emitted for the audit trail
+STRICT_HELDOUT=false
 
 # ─── Parse arguments ─────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -57,8 +66,9 @@ while [ $# -gt 0 ]; do
         --llm-model)    LLM_MODEL="$2"; shift 2 ;;
         --llm-api-base) LLM_API_BASE="$2"; shift 2 ;;
         --test-split)    TEST_SPLIT="$2"; shift 2 ;;
-        --test-seed)     TEST_SEED="$2"; shift 2 ;;
+        --test-seed)     TEST_SEED="$2"; TEST_SEED_EXPLICIT=true; shift 2 ;;
         --baseline-seed) BASELINE_SEED="$2"; shift 2 ;;
+        --strict-heldout) STRICT_HELDOUT=true; shift ;;
         --force)         FORCE=true; shift ;;
         --auto-split)    AUTO_SPLIT=true; shift ;;
         --no-auto-split) NO_AUTO_SPLIT=true; AUTO_SPLIT=false; shift ;;
@@ -92,6 +102,15 @@ while [ $# -gt 0 ]; do
             echo "                     baseline = LLM-free control loop using"
             echo "                     scripts/baseline_policy.py to pick params."
             echo "  --baseline-seed N  RNG seed for --mode baseline (default: 42)"
+            echo "  --strict-heldout   LeetCode mode: agent process cannot read the"
+            echo "                     held-out test split. dataset.yaml loses its"
+            echo "                     test: key (moved to dataset.eval.yaml), the"
+            echo "                     Bash guard rejects yolo val split=test and"
+            echo "                     reads under datasets/<name>/(images|labels)/test/."
+            echo "                     The agent can submit via scripts/run_test_tool.py"
+            echo "                     once per round, getting only a single aggregate"
+            echo "                     score. When set without --test-seed, the test"
+            echo "                     split is freshly randomized per scaffold."
             exit 0
             ;;
         *) echo "ERROR: Unknown argument: $1"; exit 1 ;;
@@ -230,6 +249,19 @@ if [ -d "$PROJECT_DIR" ]; then
         echo "  3. Overwrite with: --force"
         exit 1
     fi
+fi
+
+# ─── Strict-heldout: randomize test seed when not pinned ────────────
+# In strict-heldout mode the test split should be a fresh random sample
+# for every scaffold unless the operator explicitly pinned it (e.g. for
+# benchmark sweeps where every provider needs the same test data).
+if [ "$STRICT_HELDOUT" = "true" ] && [ "$TEST_SEED_EXPLICIT" = "false" ]; then
+    if command -v shuf >/dev/null 2>&1; then
+        TEST_SEED=$(shuf -i 1-1000000 -n 1)
+    else
+        TEST_SEED=$(python3 -c 'import random; print(random.randint(1, 1000000))')
+    fi
+    echo "[strict-heldout] randomized test seed: $TEST_SEED"
 fi
 
 # ─── Check dataset split status ───────────────────────────────────────
@@ -540,6 +572,29 @@ else
 fi
 
 echo "[INFO] Dataset YAML: $DATASET_YAML_PATH"
+
+# ─── Strict-heldout dual-yaml split ──────────────────────────────────
+# When strict mode is on, the agent-visible dataset.yaml MUST NOT mention
+# the test split. Move the test: line into a sibling dataset.eval.yaml
+# that only run_test_eval.py and run_test_tool.py read.
+DATASET_EVAL_YAML_PATH="$ROOT_DIR/datasets/$NAME/dataset.eval.yaml"
+if [ "$STRICT_HELDOUT" = "true" ] && [ "$TEST_COUNT" -gt 0 ]; then
+    echo "[strict-heldout] splitting dataset.yaml into agent-visible + eval-only"
+    TEST_LINE=$(grep -E '^test:' "$DATASET_YAML_PATH" || true)
+    # Build the eval yaml: path + just test: + names (so yolo val can resolve classes)
+    {
+        grep -E '^path:' "$DATASET_YAML_PATH"
+        echo "$TEST_LINE"
+        echo ""
+        # Re-emit names: block (works for both `names:` mapping and `names: [...]`
+        awk '/^names:/{p=1;print;next} p&&/^[^[:space:]]/{p=0} p' "$DATASET_YAML_PATH"
+    } > "$DATASET_EVAL_YAML_PATH"
+    # Strip test: from the agent-visible yaml
+    grep -v '^test:' "$DATASET_YAML_PATH" > "${DATASET_YAML_PATH}.tmp" \
+        && mv "${DATASET_YAML_PATH}.tmp" "$DATASET_YAML_PATH"
+    echo "[strict-heldout] dataset.yaml      (agent-visible): $DATASET_YAML_PATH"
+    echo "[strict-heldout] dataset.eval.yaml (operator-only): $DATASET_EVAL_YAML_PATH"
+fi
 
 # ─── Generate task-specific multi-line blocks ─────────────────────────
 TMPDIR=$(mktemp -d)
@@ -1054,6 +1109,33 @@ START: Read \`## Verified facts\` and \`## Run history\` from your prompt.
 \`\`\`
 DT2_EOF
 
+# --- ACTION_M_BLOCK (strict-heldout LeetCode submit instructions) ---
+# Empty file when strict mode is off → placeholder is replaced with nothing.
+# Otherwise contains the Action M section describing the run_test_tool.py
+# submit + rate limit + DO-NOT-leak rules.
+if [ "$STRICT_HELDOUT" = "true" ]; then
+    cat > "$TMPDIR/action_m_block.md" <<'AMEOF'
+### Action M: Submit to held-out test (LeetCode-style — one shot per round)
+
+**When**: val mAP has plateaued AND you want to know how the current best.pt scores on truly unseen data.
+
+**The rule**: this project is `--strict-heldout` — the test split is invisible to you. You CANNOT `cat` test labels, CANNOT `yolo val split=test`, and the Bash guard rejects anything that touches `datasets/<name>/(images|labels)/test/`. The sanctioned (and only) way to learn the test score is to invoke:
+
+```bash
+python3 {{ROOT_DIR}}/scripts/run_test_tool.py --project {{PROJECT_DIR}}
+```
+
+The tool returns ONE line: `mAP50=X.XXXX mAP50-95=X.XXXX images=N`. No per-class breakdown, no class names, no file paths — same shape a LeetCode submit gives you.
+
+**Rate limit**: ONE call per round. If you call it twice in the same round, the second call fails with "already queried this round". Use it once at the END of a round when you genuinely want to know the test number, not casually.
+
+**Important**: the score never re-enters subsequent prompts (it's firewalled). If you write the number into `next_instruction.md` it gets compacted away by build_prompt.py. You have one peek per round and the information dies with the round.
+
+AMEOF
+else
+    : > "$TMPDIR/action_m_block.md"
+fi
+
 # ─── Template filling ────────────────────────────────────────────────
 echo "[INFO] Filling templates..."
 mkdir -p "$PROJECT_DIR"
@@ -1106,7 +1188,7 @@ fi
 for f in "$PROJECT_DIR/yolo_folder_skill.md" "$PROJECT_DIR/hyperparameter_strategy.md"; do
     [ -f "$f" ] || continue
 
-    for block_name in CLASSES DATASET_TABLE BASELINE_SECTION RESULTS_CSV_COLUMNS TASK_CONSIDERATIONS STOP_CONDITIONS NEXT_INSTRUCTION_METRICS BEST_METRIC_AWK READ_METRICS_BLOCK DIAGNOSE_TABLE AUGMENTATION_GUIDANCE DATASET_SWITCH_GUIDANCE DECISION_TREE; do
+    for block_name in CLASSES DATASET_TABLE BASELINE_SECTION RESULTS_CSV_COLUMNS TASK_CONSIDERATIONS STOP_CONDITIONS NEXT_INSTRUCTION_METRICS BEST_METRIC_AWK READ_METRICS_BLOCK DIAGNOSE_TABLE AUGMENTATION_GUIDANCE DATASET_SWITCH_GUIDANCE DECISION_TREE ACTION_M_BLOCK; do
         block_key=$(echo "$block_name" | tr '[:upper:]' '[:lower:]')
         block_file="$TMPDIR/${block_key}.md"
         if [ -f "$block_file" ]; then
@@ -1171,6 +1253,71 @@ chmod +x "$PROJECT_DIR/train.sh"
 [ -f "$PROJECT_DIR/start_claude.sh" ]   && chmod +x "$PROJECT_DIR/start_claude.sh"
 [ -f "$PROJECT_DIR/start_agent.sh" ]    && chmod +x "$PROJECT_DIR/start_agent.sh"
 [ -f "$PROJECT_DIR/start_baseline.sh" ] && chmod +x "$PROJECT_DIR/start_baseline.sh"
+
+# ─── Strict-heldout project markers ──────────────────────────────────
+# .heldout_strict — sentinel file the claude_bash_guard walks up looking
+#                   for to decide whether the LeetCode-mode patterns fire
+# .heldout_seed   — recorded seed for the training_report.md to echo
+# Plus emit a `heldout-cut` event for the operator audit trail.
+if [ "$STRICT_HELDOUT" = "true" ]; then
+    touch "$PROJECT_DIR/.heldout_strict"
+    echo "$TEST_SEED" > "$PROJECT_DIR/.heldout_seed"
+
+    # Count test images (best-effort)
+    N_TEST=0
+    if [ -d "$DATASET/images/test" ]; then
+        N_TEST=$(find "$DATASET/images/test" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.bmp' -o -iname '*.tif' \) 2>/dev/null | wc -l)
+    elif [ -d "$DATASET/test" ]; then
+        N_TEST=$(find "$DATASET/test" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.bmp' -o -iname '*.tif' \) 2>/dev/null | wc -l)
+    fi
+
+    python3 "$ROOT_DIR/scripts/event.py" "$PROJECT_DIR" emit heldout-cut \
+        --seed "$TEST_SEED" \
+        --n-test-images "$N_TEST" \
+        --dataset "$NAME" 2>/dev/null || true
+
+    # Inject permissions block into .claude/settings.json (Claude mode only).
+    # The deny patterns block direct test-set reads; the allow whitelists
+    # the sanctioned LeetCode submit tool.
+    SETTINGS_FILE="$PROJECT_DIR/.claude/settings.json"
+    if [ -f "$SETTINGS_FILE" ]; then
+        # Pass paths via env to avoid quote-escaping hell inside the heredoc.
+        # Heredoc is QUOTED ('PY') so bash does no substitution; Python reads
+        # via os.environ and builds the patterns itself.
+        SETTINGS_FILE="$SETTINGS_FILE" \
+        STRICT_ROOT_DIR="$ROOT_DIR" \
+        STRICT_NAME="$NAME" \
+        python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+settings = Path(os.environ["SETTINGS_FILE"])
+root = os.environ["STRICT_ROOT_DIR"]
+name = os.environ["STRICT_NAME"]
+data = json.loads(settings.read_text())
+data["permissions"] = {
+    "deny": [
+        f"Read({root}/datasets/{name}/images/test/**)",
+        f"Read({root}/datasets/{name}/labels/test/**)",
+        f"Bash(*datasets/{name}/images/test/*)",
+        f"Bash(*datasets/{name}/labels/test/*)",
+        "Bash(*split=test*)",
+        "Bash(*split='test'*)",
+        'Bash(*split="test"*)',
+    ],
+    "allow": [
+        "Bash(python3 *scripts/run_test_tool.py*)",
+        "Bash(python *scripts/run_test_tool.py*)",
+    ],
+}
+settings.write_text(json.dumps(data, indent=2))
+PY
+        echo "[strict-heldout] injected permissions block into $SETTINGS_FILE"
+    fi
+    echo "[strict-heldout] marker:   $PROJECT_DIR/.heldout_strict"
+    echo "[strict-heldout] seed:     $TEST_SEED (recorded in $PROJECT_DIR/.heldout_seed)"
+fi
 
 # ─── Verify no unreplaced placeholders ────────────────────────────────
 LEFTOVER=$(grep -rn '{{[A-Z_]*}}' "$PROJECT_DIR/" 2>/dev/null | grep -v '\.log' | grep -v 'next_instruction' || true)

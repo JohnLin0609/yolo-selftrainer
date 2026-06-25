@@ -66,6 +66,12 @@ PERSIST_N = int(os.environ.get("YOLO_TRAINER_PERSIST_N", "3"))
 # of distinctive guard strings in _PROMPT_GUARD_TERMS below.
 AGENT_INVISIBLE_EVENT_TYPES = frozenset({
     "test_metrics",
+    # Strict-heldout addition: seed lets a clever agent reverse the test
+    # selection if they have the source dataset. Operator audit only.
+    "heldout_cut",
+    # The LeetCode submit-tool's response. Feeding the score back into a
+    # future prompt would defeat the held-out contract entirely.
+    "test_tool_query",
 })
 
 # Substrings that, if present in the final prompt, indicate a leak from
@@ -79,6 +85,11 @@ _PROMPT_GUARD_TERMS = (
     "test mAP",
     "held-out test",
     "test split",
+    # Strict-heldout additions
+    "heldout_cut",
+    "heldout-cut",
+    "test_tool_query",
+    "test-tool-query",
 )
 
 

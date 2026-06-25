@@ -24,6 +24,7 @@ import json
 import re
 import shlex
 import sys
+from pathlib import Path
 
 
 # Commands blocked unconditionally. Mirrors easy-agent DANGEROUS_BASH_PREFIXES
@@ -128,6 +129,86 @@ def check_datasets_write(subcommand: str) -> tuple[bool, str]:
                 f"issues as recommendations in next_instruction.md under "
                 f"`## Data-layer recommendations` instead "
                 f"(matched: {pat.pattern!r})"
+            )
+    return True, ""
+
+
+# Strict held-out (LeetCode mode). Active ONLY when a `.heldout_strict`
+# marker file exists in the project dir. Blocks every direct route an
+# agent could use to read the test data: paths under datasets/.../test/,
+# `yolo val split=test`, python -c snippets that pass split="test", etc.
+# The sanctioned exit is `scripts/run_test_tool.py`, which is explicitly
+# whitelisted in the check below.
+_HELDOUT_READ_PATTERNS = [
+    # Any path touching images/test/ or labels/test/ under datasets/
+    re.compile(r"\bdatasets/[^\s|;&'\"]*/(?:images|labels)/test\b"),
+    # `yolo val split=test` and friends
+    re.compile(r"\byolo\b[^|;&]*\bsplit\s*=\s*['\"]?test\b"),
+    re.compile(r"\bsplit\s*=\s*['\"]?test\b[^|;&]*\byolo\b"),
+    # Python keyword-arg or dict-literal carrying split="test"
+    re.compile(r"['\"]\s*split\s*['\"]\s*:\s*['\"]\s*test\b"),
+    re.compile(r"\bsplit\s*=\s*['\"]test['\"]"),
+]
+
+
+def _find_heldout_marker(cwd: Path | None = None) -> Path | None:
+    """Walk up from `cwd` (default: actual cwd) looking for a `.heldout_strict`
+    marker file. Returns the path to the marker, or None if not found.
+
+    The guard runs as a subprocess of the Claude/agent loop; the agent's
+    Bash tool inherits the project dir as cwd, so walking up from cwd
+    reliably reaches the project dir if --strict-heldout was scaffolded.
+    """
+    start = cwd if cwd is not None else Path.cwd()
+    try:
+        start = start.resolve()
+    except (OSError, RuntimeError):
+        return None
+    cur = start
+    for _ in range(6):   # bounded walk — 6 levels is enough for any sane project layout
+        marker = cur / ".heldout_strict"
+        if marker.is_file():
+            return marker
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
+
+
+def _is_sanctioned_test_tool(subcommand: str) -> bool:
+    """True iff the subcommand invokes scripts/run_test_tool.py via python.
+
+    This is the SOLE sanctioned route to the held-out test split when
+    strict mode is on. The script returns one line of summary; no
+    per-class breakdown, no file paths, no images. Stdout flows back
+    through the agent's Bash tool but contains nothing the agent could
+    use to enumerate the test set.
+    """
+    return bool(
+        re.search(
+            r"\b(?:python|python3)\b[^|;&]*\bscripts/run_test_tool\.py\b",
+            subcommand,
+        )
+    )
+
+
+def check_heldout_read(subcommand: str, *, strict: bool) -> tuple[bool, str]:
+    """When strict mode is on, reject every direct route to the held-out
+    test split EXCEPT the sanctioned `scripts/run_test_tool.py` invocation.
+
+    `strict` is the result of `_find_heldout_marker()` — when False the
+    function is a no-op and behavior is identical to pre-strict-heldout.
+    """
+    if not strict:
+        return True, ""
+    if _is_sanctioned_test_tool(subcommand):
+        return True, ""
+    for pat in _HELDOUT_READ_PATTERNS:
+        if pat.search(subcommand):
+            return False, (
+                f"held-out test split is read-only via "
+                f"`python3 scripts/run_test_tool.py` (LeetCode-mode); "
+                f"direct read is blocked (matched: {pat.pattern!r})"
             )
     return True, ""
 
@@ -247,8 +328,15 @@ def head_token(subcommand: str) -> tuple[str, list[str]]:
     return tokens[idx], tokens[idx:]
 
 
-def check_command(command: str) -> tuple[bool, str]:
-    """Return (allowed, reason). reason is empty when allowed."""
+def check_command(command: str, *, strict_heldout: bool | None = None) -> tuple[bool, str]:
+    """Return (allowed, reason). reason is empty when allowed.
+
+    `strict_heldout` controls whether the LeetCode-mode heldout patterns
+    fire. None (default) → look for a `.heldout_strict` marker file by
+    walking up from cwd. True/False → force on/off (used by tests).
+    """
+    if strict_heldout is None:
+        strict_heldout = _find_heldout_marker() is not None
     for sub in split_subcommands(command):
         # Check the train.sh-write patterns BEFORE the head-token deny list.
         # This catches `bash -c "sed -i ... train.sh"`-style wrappers where
@@ -261,6 +349,14 @@ def check_command(command: str) -> tuple[bool, str]:
         # are "trusted-asset" guards; ordering vs bypass patterns is
         # irrelevant since they're disjoint.
         ok, reason = check_datasets_write(sub)
+        if not ok:
+            return False, f"{reason} (subcommand: {sub!r})"
+        # Strict-heldout mode (active only when project carries marker file).
+        # Sanctioned route is `python3 scripts/run_test_tool.py`; everything
+        # else that touches images/test/, labels/test/, or split=test is
+        # rejected here BEFORE the more general patterns so the error
+        # message is specific.
+        ok, reason = check_heldout_read(sub, strict=strict_heldout)
         if not ok:
             return False, f"{reason} (subcommand: {sub!r})"
         # Bypass patterns: interpreter -c, eval, find -delete, awk system(),
