@@ -24,7 +24,10 @@ Event types (use kebab-case on the CLI; underscore in the JSON):
   training-metrics     round, run_name, best_metric_name, best_metric_value,
                        best_epoch, final_epoch, total_epochs, patience_triggered
   claude-started       round, session_id
-  claude-finished      round, exit_code, duration_sec
+  claude-finished      round, exit_code, duration_sec, total_cost_usd
+                       (total_cost_usd is OPTIONAL — older events lack it
+                       and the cross-provider benchmark aggregator treats
+                       missing-as-zero. New runs emit it from run_agent.py.)
   validation-failed    round, violations (JSON list)
   preflight-failed     round, reason
   halted               reason, details (JSON dict)
@@ -548,7 +551,11 @@ EVENT_FIELDS = {
                           "final_epoch": int, "total_epochs": int,
                           "patience_triggered": bool},
     "claude-started":    {"round": int,    "session_id": str},
-    "claude-finished":   {"round": int,    "exit_code": int,   "duration_sec": float},
+    "claude-finished":   {"round": int,    "exit_code": int,   "duration_sec": float,
+                          # OPTIONAL — total LLM spend across the session,
+                          # for the cross-provider benchmark. build_payload
+                          # skips None values so existing callers stay valid.
+                          "total_cost_usd": float},
     "validation-failed": {"round": int,    "violations_json": "json"},
     "preflight-failed":  {"round": int,    "reason": str},
     "halted":            {"reason": str,   "details_json": "json"},

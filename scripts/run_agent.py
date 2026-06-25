@@ -582,6 +582,7 @@ def main() -> int:
             args.project, "claude-finished",
             round=args.round, exit_code=130,
             duration_sec=int(time.time() - start_ts),
+            total_cost_usd=total_cost,
         )
         return 130
     except Exception as e:
@@ -591,6 +592,7 @@ def main() -> int:
             args.project, "claude-finished",
             round=args.round, exit_code=1,
             duration_sec=int(time.time() - start_ts),
+            total_cost_usd=total_cost,
         )
         return 1
 
@@ -608,6 +610,7 @@ def main() -> int:
         args.project, "claude-finished",
         round=args.round, exit_code=0,
         duration_sec=int(time.time() - start_ts),
+        total_cost_usd=total_cost,
     )
     return 0
 

@@ -43,18 +43,47 @@ with per-round metrics, best model path, and an ASCII bar chart of progression.
 The agent is provider-agnostic via [LiteLLM](https://github.com/BerriAI/litellm).
 Pick the one you have access to.
 
-| Provider | Mode | Reliability | Notes |
+| Provider | Mode | API key | Notes |
 |---|---|---|---|
-| **Claude CLI** | `--mode claude` (default) | ★★★★★ | Uses the `claude` binary; requires a Claude.ai subscription or API. |
-| **Anthropic API** | `--mode agent --provider anthropic --model claude-opus-4-7` | ★★★★★ | Set `ANTHROPIC_API_KEY`. |
-| **OpenAI** | `--mode agent --provider openai --model gpt-4o` | ★★★★★ | Set `OPENAI_API_KEY`. |
-| **Gemini** | `--mode agent --provider gemini --model gemini-2.5-pro` | ★★★★ | Set `GEMINI_API_KEY`. |
-| **Groq** | `--mode agent --provider groq --model llama-3.3-70b-versatile` | ★★★ | Set `GROQ_API_KEY`. |
-| **Ollama (local)** | `--mode agent --provider ollama --model qwen3:8b` | ★★ | Free, but small local models struggle with multi-tool ReAct. See [docs/local-llms.md](docs/local-llms.md). |
-| **vLLM / self-hosted** | `--mode agent --provider vllm --model <name> --api-base <url>` | depends on model | OpenAI-compatible endpoint. |
+| **Claude CLI** | `--mode claude` (default) | Claude.ai subscription or `ANTHROPIC_API_KEY` | Uses the `claude` binary. |
+| **Anthropic API** | `--mode agent --provider anthropic --model claude-opus-4-7` | `ANTHROPIC_API_KEY` | |
+| **OpenAI** | `--mode agent --provider openai --model gpt-4o` | `OPENAI_API_KEY` | |
+| **Gemini** | `--mode agent --provider gemini --model gemini-2.5-pro` | `GEMINI_API_KEY` | |
+| **Groq** | `--mode agent --provider groq --model llama-3.3-70b-versatile` | `GROQ_API_KEY` | |
+| **Ollama (local)** | `--mode agent --provider ollama --model qwen3:8b` | — (local) | Small local models struggle with multi-tool ReAct. See [docs/local-llms.md](docs/local-llms.md). |
+| **vLLM / self-hosted** | `--mode agent --provider vllm --model <name> --api-base <url>` | — (set via `--api-base`) | OpenAI-compatible endpoint. |
 
 For agent mode, see [docs/usage.md](docs/usage.md#api-keys) for where to set
 API keys.
+
+### Reliability — measure it, don't guess
+
+Subjective star ratings used to live here. They're replaced by a
+reproducible benchmark: same demo dataset, same rounds, same seed across
+providers, with the numbers backed by each project's `events.jsonl`.
+
+```bash
+python3 scripts/benchmark.py \
+    --providers anthropic openai gemini ollama \
+    --models   claude-haiku-4-5-20251001 gpt-4o-mini gemini-2.5-flash qwen2.5:32b \
+    --dataset  datasets/demo \
+    --rounds   3 \
+    --output   benchmark_report.md
+```
+
+Required env vars are checked up-front so a missing key fails fast.
+Workspaces land under `projects/bench_<timestamp>_<provider>_<modelslug>/`.
+The aggregator (`scripts/benchmark_aggregate.py`) sums LLM cost (now
+written into `claude_finished` events as `total_cost_usd`), total wall
+time, val/test mAP, and circuit-breaker trips per provider. The renderer
+(`scripts/benchmark_render.py`) sorts by val mAP DESC.
+
+After running, paste the printed Markdown table between the markers below.
+
+<!-- BENCHMARK TABLE START -->
+_No benchmark run committed yet. Run the command above and paste the
+output here so future readers see real numbers._
+<!-- BENCHMARK TABLE END -->
 
 ---
 

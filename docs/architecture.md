@@ -365,6 +365,22 @@ To add a new operator-only event type, list it in
 `AGENT_INVISIBLE_EVENT_TYPES` AND add distinctive guard substrings to
 `_PROMPT_GUARD_TERMS` in the same file. Both must be updated together.
 
+### Cross-provider benchmark (out-of-band, observability tooling)
+
+Not a trust boundary — a measurement loop. `scripts/benchmark.py` sweeps
+the same training pipeline against multiple LLM providers on the same
+demo dataset and emits a Markdown comparison table. The data comes from
+each provider's own `projects/<name>/events.jsonl`, aggregated by the
+pure functions `scripts/benchmark_aggregate.py` and rendered by
+`scripts/benchmark_render.py`. The README's old subjective star ratings
+were replaced with this script's output.
+
+For the cost column to be populated, `run_agent.py` now emits
+`total_cost_usd` on each `claude_finished` event (the per-turn cost from
+`litellm.completion_cost` is accumulated across the session). Older
+events.jsonl files lack the field; the aggregator treats missing as 0.0
+so old projects still aggregate cleanly.
+
 ### Boundary 5 — Plateau circuit
 
 The crash circuit breaker (Boundary 3) handles hard failures. Plateau is the
