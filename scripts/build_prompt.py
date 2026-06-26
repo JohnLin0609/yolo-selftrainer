@@ -75,16 +75,17 @@ AGENT_INVISIBLE_EVENT_TYPES = frozenset({
 })
 
 # Substrings that, if present in the final prompt, indicate a leak from
-# the firewall. Conservative — anything that resembles a test-eval keyword
-# is flagged. Update in lockstep with AGENT_INVISIBLE_EVENT_TYPES above.
+# the firewall. These must be ACTUAL leak signals (event-payload names,
+# metric values, code-level access patterns) — NOT descriptive English
+# phrases like "held-out test" or "test split", which legitimately appear
+# in templates, docs, and train.sh banner output without leaking anything.
+# Update in lockstep with AGENT_INVISIBLE_EVENT_TYPES above.
 _PROMPT_GUARD_TERMS = (
     "test_metrics",
     "test-metrics",
     "split=test",
     "test_mAP",
     "test mAP",
-    "held-out test",
-    "test split",
     # Strict-heldout additions
     "heldout_cut",
     "heldout-cut",

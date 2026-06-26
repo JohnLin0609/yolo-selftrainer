@@ -171,8 +171,11 @@ the `Bash` tool. Five trust boundaries — see
    above threshold, the chain halts cleanly. Overrides via
    `YOLO_TRAINER_PLATEAU_N` / `_THRESHOLD` / `_M`.
 
-The autonomous loop runs Claude with `--dangerously-skip-permissions` (or
-the equivalent in agent mode); the boundaries above are what restore the
+The autonomous loop runs Claude with `--permission-mode auto`, which
+applies `permissions.allow`/`deny` from `.claude/settings.json` (e.g. the
+strict-heldout deny rules) without prompting the operator, and lets the
+PreToolUse bash-guard hook fire on top. (Agent mode uses an equivalent
+non-interactive policy.) The boundaries above are what restore the
 safety the UI prompt normally provides.
 
 ---
